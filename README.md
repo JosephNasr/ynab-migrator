@@ -1,5 +1,7 @@
 # ynab-migrator
 
+Note: This codebase is fully written by codex.
+
 Resumable Python CLI to migrate YNAB data from one plan to another via the public API.
 
 ## Guarantees and Safety
