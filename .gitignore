@@ -1,0 +1,29 @@
+# Local migration artifacts (sensitive financial data)
+.ynab_migrator/
+.ynab_migrator*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+
+# Packaging/build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
