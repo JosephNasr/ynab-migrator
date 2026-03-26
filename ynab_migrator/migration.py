@@ -458,6 +458,8 @@ class MigrationEngine:
                     "reused_unsupported_accounts_by_name_type": 0,
                     "ambiguous_account_name_type_matches": 0,
                     "ambiguous_unsupported_account_name_type_matches": 0,
+                    "reused_categories_by_name_group": 0,
+                    "ambiguous_category_name_group_matches": 0,
                 },
             }
             if account_note_count:
@@ -1586,6 +1588,26 @@ class MigrationEngine:
             source_categories,
             key=lambda item: (item.get("category_group_id") or "", item.get("name") or "", item.get("id") or ""),
         )
+        destination_categories = clean_deleted(self.dest_client.get_categories(self.dest_plan_id).get("categories", []))
+        categories_by_group_and_name: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for destination_category in destination_categories:
+            destination_id = destination_category.get("id")
+            destination_name = destination_category.get("name")
+            destination_group_id = destination_category.get("category_group_id")
+            if (
+                not destination_id
+                or not isinstance(destination_name, str)
+                or not isinstance(destination_group_id, str)
+            ):
+                continue
+            key = (destination_group_id, destination_name)
+            categories_by_group_and_name.setdefault(key, []).append(destination_category)
+
+        existing_category_map = checkpoint.get_mapping_dict("category")
+        used_destination_category_ids: Set[str] = {
+            str(dest_id) for dest_id in existing_category_map.values() if dest_id
+        }
+
         for idx in range(cursor, len(categories)):
             self._log_progress("apply", "categories", idx + 1, len(categories))
             category = categories[idx]
@@ -1620,6 +1642,57 @@ class MigrationEngine:
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
 
+            category_name = category.get("name")
+            if isinstance(category_name, str):
+                existing_matches = categories_by_group_and_name.get((str(dest_group_id), category_name), [])
+                if len(existing_matches) == 1:
+                    existing_dest_id = str(existing_matches[0].get("id"))
+                    if existing_dest_id in used_destination_category_ids:
+                        self._record_issue(
+                            report,
+                            "warnings",
+                            "category",
+                            source_id,
+                            "exact destination category name+group match already mapped; creating new category",
+                            details={
+                                "category_name": category_name,
+                                "source_category_group_id": source_group_id,
+                                "dest_category_group_id": dest_group_id,
+                                "matched_destination_category_id": existing_dest_id,
+                            },
+                        )
+                        self._increment_system_counter(report, "ambiguous_category_name_group_matches")
+                    else:
+                        checkpoint.set_mapping("category", source_id, existing_dest_id)
+                        used_destination_category_ids.add(existing_dest_id)
+                        checkpoint.add_event(
+                            "INFO",
+                            f"category mapped {source_id} -> {existing_dest_id} "
+                            "(reused existing destination category by exact name+group)",
+                        )
+                        self._increment_system_counter(report, "reused_categories_by_name_group")
+                        checkpoint.set_cursor(cursor_name, idx + 1)
+                        continue
+                elif len(existing_matches) > 1:
+                    self._record_issue(
+                        report,
+                        "warnings",
+                        "category",
+                        source_id,
+                        "multiple destination categories matched exact name+group; creating new category",
+                        details={
+                            "category_name": category_name,
+                            "source_category_group_id": source_group_id,
+                            "dest_category_group_id": dest_group_id,
+                            "matched_destination_category_ids": [
+                                str(match.get("id"))
+                                for match in existing_matches
+                                if match.get("id")
+                            ],
+                        },
+                    )
+                    self._increment_system_counter(report, "ambiguous_category_name_group_matches")
+
             payload = {
                 "name": category.get("name"),
                 "note": category.get("note"),
@@ -1635,6 +1708,10 @@ class MigrationEngine:
                 if not dest_id:
                     raise RuntimeError("category creation response missing id")
                 checkpoint.set_mapping("category", source_id, dest_id)
+                used_destination_category_ids.add(str(dest_id))
+                if isinstance(payload.get("name"), str):
+                    key = (str(dest_group_id), payload["name"])
+                    categories_by_group_and_name.setdefault(key, []).append(created)
                 checkpoint.add_event("INFO", f"category mapped {source_id} -> {dest_id}")
             except Exception as error:  # noqa: BLE001
                 self._record_issue(
