@@ -80,15 +80,6 @@ ynab-migrator \
   resume
 ```
 
-## Apply Scope Selector
-
-`apply` starts with an interactive scope selector:
-
-- Up/Down + Enter
-- first option: `Everything`
-- narrower scopes auto-include required dependencies
-- non-interactive terminals and `--json` default to `Everything`
-
 ## Artifacts (`--workdir`)
 
 - `snapshot.json`
