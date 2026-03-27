@@ -92,7 +92,6 @@ ynab-migrator \
 ## Important Limitations
 
 - Destination plan must already exist.
-- Account notes and month notes are read-only in current YNAB API (reported, not written).
 - The `plan` phase may report required or recommended manual actions that should be reviewed before running `apply`.
 - Split scheduled transactions are not writable via current API write schema.
 
