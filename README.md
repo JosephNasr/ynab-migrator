@@ -110,6 +110,7 @@ ynab-migrator \
 - Put global flags before subcommand (`plan`/`apply`/`verify`/`resume`).
 - If snapshot/checkpoint mismatch errors appear, rerun from a clean workdir.
 - If system-entity mapping errors appear, verify required system groups/categories exist exactly once in destination.
+- Category reuse supports both YNAB `/categories` response shapes: flat `categories` and grouped `category_groups[*].categories`.
 
 ## Advanced / Internal Behavior
 

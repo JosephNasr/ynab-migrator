@@ -1827,6 +1827,47 @@ class MigrationEngine:
             finally:
                 checkpoint.set_cursor(cursor_name, idx + 1)
 
+    def _extract_destination_categories(
+        self,
+        categories_response: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        categories: List[Dict[str, Any]] = []
+
+        flat_categories = categories_response.get("categories")
+        if isinstance(flat_categories, list):
+            for item in flat_categories:
+                if isinstance(item, dict):
+                    categories.append(item)
+
+        category_groups = categories_response.get("category_groups")
+        if isinstance(category_groups, list):
+            for group in category_groups:
+                if not isinstance(group, dict):
+                    continue
+                nested_categories = group.get("categories")
+                if not isinstance(nested_categories, list):
+                    continue
+                group_id = group.get("id")
+                for item in nested_categories:
+                    if not isinstance(item, dict):
+                        continue
+                    if not item.get("category_group_id") and group_id:
+                        merged = dict(item)
+                        merged["category_group_id"] = group_id
+                        categories.append(merged)
+                    else:
+                        categories.append(item)
+
+        deduped_by_id: Dict[str, Dict[str, Any]] = {}
+        without_id: List[Dict[str, Any]] = []
+        for category in clean_deleted(categories):
+            category_id = category.get("id")
+            if category_id:
+                deduped_by_id[str(category_id)] = category
+            else:
+                without_id.append(category)
+        return list(deduped_by_id.values()) + without_id
+
     def _create_categories(
         self,
         source_categories: List[Dict[str, Any]],
@@ -1840,7 +1881,23 @@ class MigrationEngine:
             source_categories,
             key=lambda item: (item.get("category_group_id") or "", item.get("name") or "", item.get("id") or ""),
         )
-        destination_categories = clean_deleted(self.dest_client.get_categories(self.dest_plan_id).get("categories", []))
+        categories_response = self.dest_client.get_categories(self.dest_plan_id)
+        destination_categories = self._extract_destination_categories(categories_response)
+        has_flat_shape = isinstance(categories_response.get("categories"), list)
+        has_grouped_shape = isinstance(categories_response.get("category_groups"), list)
+        if not destination_categories and not has_flat_shape and not has_grouped_shape:
+            self._record_issue(
+                report,
+                "warnings",
+                "category",
+                None,
+                "destination categories response is missing both 'categories' and 'category_groups'; "
+                "proceeding without preexisting category reuse",
+                details={
+                    "response_keys": sorted(str(key) for key in categories_response.keys()),
+                },
+            )
+
         categories_by_group_and_name: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         for destination_category in destination_categories:
             destination_id = destination_category.get("id")
