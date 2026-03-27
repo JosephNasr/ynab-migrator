@@ -102,15 +102,13 @@ ynab-migrator \
 
 - Destination plan must already exist.
 - Account notes and month notes are read-only in current YNAB API (reported, not written).
+- The `plan` phase may report required or recommended manual actions that should be reviewed before running `apply`.
 - Split scheduled transactions are not writable via current API write schema.
-- Some system entities must already exist in destination (`Internal Master Category`, `Hidden Categories`, `Credit Card Payments`, internal inflow/uncategorized).
 
 ## Troubleshooting
 
 - Put global flags before subcommand (`plan`/`apply`/`verify`/`resume`).
 - If snapshot/checkpoint mismatch errors appear, rerun from a clean workdir.
-- If system-entity mapping errors appear, verify required system groups/categories exist exactly once in destination.
-- Category reuse supports both YNAB `/categories` response shapes: flat `categories` and grouped `category_groups[*].categories`.
 
 ## Advanced / Internal Behavior
 
