@@ -285,6 +285,9 @@ class YNABClient:
     def get_transactions(self, plan_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/plans/{plan_id}/transactions")
 
+    def get_transaction(self, plan_id: str, transaction_id: str) -> Dict[str, Any]:
+        return self._request("GET", f"/plans/{plan_id}/transactions/{transaction_id}")
+
     def get_account_transactions(self, plan_id: str, account_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/plans/{plan_id}/accounts/{account_id}/transactions")
 
@@ -311,6 +314,13 @@ class YNABClient:
         else:
             body = {"transaction": transactions}
         return self._request("POST", f"/plans/{plan_id}/transactions", json_body=body)
+
+    def update_transaction(self, plan_id: str, transaction_id: str, transaction: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request(
+            "PUT",
+            f"/plans/{plan_id}/transactions/{transaction_id}",
+            json_body={"transaction": transaction},
+        )
 
     def create_scheduled_transaction(
         self, plan_id: str, scheduled_transaction: Dict[str, Any]

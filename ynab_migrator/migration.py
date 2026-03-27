@@ -2128,6 +2128,9 @@ class MigrationEngine:
         cursor_name = "transactions_idx"
         cursor = checkpoint.get_cursor(cursor_name)
         transactions = sorted(source_transactions, key=lambda item: (item.get("date") or "", item.get("id") or ""))
+        transactions_by_id = {
+            str(tx.get("id")): tx for tx in transactions if isinstance(tx, dict) and tx.get("id")
+        }
 
         existing_import_map = self._load_destination_transaction_import_map()
         account_map = checkpoint.get_mapping_dict("account")
@@ -2165,6 +2168,33 @@ class MigrationEngine:
                     cursor = scan_idx
                     checkpoint.set_cursor(cursor_name, cursor)
                     continue
+
+                transfer_partner_source_id = tx.get("transfer_transaction_id")
+                if transfer_partner_source_id:
+                    pair_ids = sorted([str(source_id), str(transfer_partner_source_id)])
+                    canonical_source_id = pair_ids[0]
+                    if str(source_id) != canonical_source_id:
+                        scan_idx += 1
+                        cursor = scan_idx
+                        checkpoint.set_cursor(cursor_name, cursor)
+                        continue
+                    partner_tx = transactions_by_id.get(str(transfer_partner_source_id))
+                    if isinstance(partner_tx, dict) and not is_deleted(partner_tx):
+                        self._process_transfer_transaction_pair(
+                            primary_tx=tx,
+                            counterpart_tx=partner_tx,
+                            source_accounts_by_id=source_accounts_by_id,
+                            source_payees_by_id=source_payees_by_id,
+                            checkpoint=checkpoint,
+                            report=report,
+                            account_map=account_map,
+                            category_map=category_map,
+                            payee_map=payee_map,
+                        )
+                        scan_idx += 1
+                        cursor = scan_idx
+                        checkpoint.set_cursor(cursor_name, cursor)
+                        continue
 
                 import_id = deterministic_import_id(self.source_plan_id, source_id)
                 if import_id in existing_import_map:
@@ -2361,6 +2391,172 @@ class MigrationEngine:
                 details=self._transaction_issue_details(source_tx),
             )
             return False
+
+    @staticmethod
+    def _extract_saved_transactions(response_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        created_objects: List[Dict[str, Any]] = []
+        if isinstance(response_data.get("transaction"), dict):
+            created_objects = [response_data["transaction"]]
+        elif isinstance(response_data.get("transactions"), list):
+            created_objects = [item for item in response_data["transactions"] if isinstance(item, dict)]
+        return created_objects
+
+    def _process_transfer_transaction_pair(
+        self,
+        primary_tx: Dict[str, Any],
+        counterpart_tx: Dict[str, Any],
+        source_accounts_by_id: Dict[str, Dict[str, Any]],
+        source_payees_by_id: Dict[str, Dict[str, Any]],
+        checkpoint: CheckpointStore,
+        report: Dict[str, Any],
+        account_map: Dict[str, str],
+        category_map: Dict[str, str],
+        payee_map: Dict[str, str],
+    ) -> None:
+        primary_source_id = str(primary_tx.get("id") or "")
+        counterpart_source_id = str(counterpart_tx.get("id") or "")
+        if not primary_source_id or not counterpart_source_id:
+            return
+        if checkpoint.get_mapping("transaction", primary_source_id) and checkpoint.get_mapping(
+            "transaction", counterpart_source_id
+        ):
+            return
+
+        payload, error = self._build_transaction_payload(
+            tx=primary_tx,
+            source_accounts_by_id=source_accounts_by_id,
+            source_payees_by_id=source_payees_by_id,
+            account_map=account_map,
+            category_map=category_map,
+            payee_map=payee_map,
+            include_import_id=False,
+            report=report,
+        )
+        if payload is None:
+            self._record_issue(
+                report,
+                "errors",
+                "transaction",
+                primary_source_id,
+                error or "payload build failed",
+                details=self._transaction_issue_details(primary_tx),
+            )
+            return
+        payload.pop("import_id", None)
+
+        try:
+            response_data = self.dest_client.create_transactions(self.dest_plan_id, payload)
+            saved_transactions = self._extract_saved_transactions(response_data)
+
+            primary_dest_account_id = account_map.get(primary_tx.get("account_id"))
+            counterpart_dest_account_id = account_map.get(counterpart_tx.get("account_id"))
+            primary_dest_id: Optional[str] = None
+            counterpart_dest_id: Optional[str] = None
+
+            for saved in saved_transactions:
+                saved_id = saved.get("id")
+                saved_account_id = saved.get("account_id")
+                if not saved_id:
+                    continue
+                saved_id_str = str(saved_id)
+                if primary_dest_account_id and saved_account_id == primary_dest_account_id:
+                    primary_dest_id = saved_id_str
+                if counterpart_dest_account_id and saved_account_id == counterpart_dest_account_id:
+                    counterpart_dest_id = saved_id_str
+
+            if primary_dest_id is None and saved_transactions:
+                candidate = saved_transactions[0].get("id")
+                if candidate:
+                    primary_dest_id = str(candidate)
+
+            if primary_dest_id and counterpart_dest_id is None:
+                try:
+                    fetched = self.dest_client.get_transaction(self.dest_plan_id, primary_dest_id).get(
+                        "transaction", {}
+                    )
+                    linked_dest_id = fetched.get("transfer_transaction_id")
+                    if linked_dest_id:
+                        counterpart_dest_id = str(linked_dest_id)
+                except Exception:  # noqa: BLE001
+                    counterpart_dest_id = None
+
+            if primary_dest_id:
+                checkpoint.set_mapping("transaction", primary_source_id, primary_dest_id)
+            if counterpart_dest_id:
+                checkpoint.set_mapping("transaction", counterpart_source_id, counterpart_dest_id)
+
+            if not primary_dest_id or not counterpart_dest_id:
+                missing_source_id = primary_source_id if not primary_dest_id else counterpart_source_id
+                self._record_issue(
+                    report,
+                    "errors",
+                    "transaction",
+                    missing_source_id,
+                    "could not resolve destination transfer transaction ID after create",
+                    details={
+                        "primary_source_transaction_id": primary_source_id,
+                        "counterpart_source_transaction_id": counterpart_source_id,
+                        "primary_dest_transaction_id": primary_dest_id,
+                        "counterpart_dest_transaction_id": counterpart_dest_id,
+                    },
+                )
+                return
+
+            self._sync_transfer_pair_cleared_status(
+                primary_source_tx=primary_tx,
+                counterpart_source_tx=counterpart_tx,
+                primary_dest_id=primary_dest_id,
+                counterpart_dest_id=counterpart_dest_id,
+                report=report,
+            )
+        except Exception as error_obj:  # noqa: BLE001
+            self._record_issue(
+                report,
+                "errors",
+                "transaction",
+                primary_source_id,
+                f"single transaction failed: {summarize_exception(error_obj)}",
+                details=self._transaction_issue_details(primary_tx),
+            )
+
+    def _sync_transfer_pair_cleared_status(
+        self,
+        primary_source_tx: Dict[str, Any],
+        counterpart_source_tx: Dict[str, Any],
+        primary_dest_id: str,
+        counterpart_dest_id: str,
+        report: Dict[str, Any],
+    ) -> None:
+        desired = [
+            (primary_dest_id, primary_source_tx.get("cleared"), str(primary_source_tx.get("id") or "")),
+            (
+                counterpart_dest_id,
+                counterpart_source_tx.get("cleared"),
+                str(counterpart_source_tx.get("id") or ""),
+            ),
+        ]
+        valid_cleared = {"cleared", "uncleared", "reconciled"}
+        for dest_id, cleared_value, source_id in desired:
+            if not isinstance(cleared_value, str) or cleared_value not in valid_cleared:
+                continue
+            try:
+                self.dest_client.update_transaction(
+                    self.dest_plan_id,
+                    dest_id,
+                    {"cleared": cleared_value},
+                )
+            except Exception as error_obj:  # noqa: BLE001
+                self._record_issue(
+                    report,
+                    "warnings",
+                    "transaction",
+                    source_id or None,
+                    f"failed to sync transfer cleared status: {summarize_exception(error_obj)}",
+                    details={
+                        "dest_transaction_id": dest_id,
+                        "desired_cleared": cleared_value,
+                    },
+                )
 
     def _is_probable_batch_size_error(self, error: Exception) -> bool:
         rendered = summarize_exception(error).lower()
@@ -2999,7 +3195,9 @@ class MigrationEngine:
                 transformed_subs.append(transformed_sub)
             payload["subtransactions"] = transformed_subs
 
-        if include_import_id and source_id:
+        if include_import_id and source_id and not tx.get("transfer_account_id") and not tx.get(
+            "transfer_transaction_id"
+        ):
             payload["import_id"] = deterministic_import_id(self.source_plan_id, source_id)
         return payload, None
 
