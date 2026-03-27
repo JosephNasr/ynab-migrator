@@ -201,6 +201,7 @@ Default workdir: `./.ynab_migrator`
 ## 7) YNAB-Specific Behavior Already Encoded
 
 - Rate limit assumption: `200 req/hour` (client-side rolling limiter).
+- Only transaction write endpoints support array request bodies in current API (`POST /plans/{plan_id}/transactions`, `PATCH /plans/{plan_id}/transactions`).
 - Split scheduled transactions are not created (excluded with warning).
 - Scheduled transaction date is shifted forward if not future-dated at apply time.
 - Month category patches only update `budgeted`.

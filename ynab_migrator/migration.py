@@ -2133,6 +2133,14 @@ class MigrationEngine:
         account_map = checkpoint.get_mapping_dict("account")
         category_map = checkpoint.get_mapping_dict("category")
         payee_map = checkpoint.get_mapping_dict("payee")
+        runtime_batch_limit = _safe_int(
+            checkpoint.get_metadata("transactions_runtime_batch_limit"),
+            self.tx_batch_size,
+        )
+        runtime_batch_limit = max(1, min(self.tx_batch_size, runtime_batch_limit))
+        batching = report.setdefault("batching", {})
+        batching["tx_batch_target"] = self.tx_batch_size
+        batching["tx_batch_runtime_limit"] = runtime_batch_limit
 
         while cursor < len(transactions):
             self._log_progress("apply", "transactions", cursor + 1, len(transactions))
@@ -2220,18 +2228,28 @@ class MigrationEngine:
                     }
                 )
                 scan_idx += 1
-                if len(batch_entries) >= self.tx_batch_size:
+                if len(batch_entries) >= runtime_batch_limit:
                     break
 
             if not batch_entries:
                 continue
 
-            self._submit_transaction_batch_entries(
+            max_success_batch_size, saw_size_limit = self._submit_transaction_batch_entries(
                 batch_entries=batch_entries,
                 checkpoint=checkpoint,
                 report=report,
                 existing_import_map=existing_import_map,
             )
+            if saw_size_limit and max_success_batch_size > 0 and max_success_batch_size < runtime_batch_limit:
+                runtime_batch_limit = max_success_batch_size
+                batching["tx_batch_runtime_limit"] = runtime_batch_limit
+                checkpoint.set_metadata("transactions_runtime_batch_limit", runtime_batch_limit)
+                self._log_stage(
+                    "apply",
+                    "transactions_batch_limit",
+                    "complete",
+                    effective_batch_size=runtime_batch_limit,
+                )
 
             cursor = scan_idx
             checkpoint.set_cursor(cursor_name, cursor)
@@ -2242,18 +2260,18 @@ class MigrationEngine:
         checkpoint: CheckpointStore,
         report: Dict[str, Any],
         existing_import_map: Dict[str, str],
-    ) -> None:
+    ) -> Tuple[int, bool]:
         if not batch_entries:
-            return
+            return 0, False
 
         if len(batch_entries) == 1:
-            self._submit_single_transaction_entry(
+            success = self._submit_single_transaction_entry(
                 entry=batch_entries[0],
                 checkpoint=checkpoint,
                 report=report,
                 existing_import_map=existing_import_map,
             )
-            return
+            return (1 if success else 0), False
 
         source_by_import = {
             str(entry["import_id"]): str(entry["source_id"])
@@ -2266,7 +2284,7 @@ class MigrationEngine:
             if isinstance(entry.get("payload"), dict)
         ]
         if not payloads:
-            return
+            return 0, False
 
         try:
             response_data = self.dest_client.create_transactions(self.dest_plan_id, payloads)
@@ -2277,8 +2295,9 @@ class MigrationEngine:
                 existing_import_map=existing_import_map,
                 report=report,
             )
-            return
+            return len(payloads), False
         except Exception as batch_error:  # noqa: BLE001
+            size_limit_hit = self._is_probable_batch_size_error(batch_error)
             self._record_issue(
                 report,
                 "warnings",
@@ -2289,22 +2308,24 @@ class MigrationEngine:
                     "batch_size": len(batch_entries),
                     "first_source_transaction_id": str(batch_entries[0].get("source_id") or ""),
                     "last_source_transaction_id": str(batch_entries[-1].get("source_id") or ""),
+                    "probable_batch_size_limit": size_limit_hit,
                 },
             )
 
         midpoint = max(1, len(batch_entries) // 2)
-        self._submit_transaction_batch_entries(
+        left_success, left_size_limit = self._submit_transaction_batch_entries(
             batch_entries=batch_entries[:midpoint],
             checkpoint=checkpoint,
             report=report,
             existing_import_map=existing_import_map,
         )
-        self._submit_transaction_batch_entries(
+        right_success, right_size_limit = self._submit_transaction_batch_entries(
             batch_entries=batch_entries[midpoint:],
             checkpoint=checkpoint,
             report=report,
             existing_import_map=existing_import_map,
         )
+        return max(left_success, right_success), (size_limit_hit or left_size_limit or right_size_limit)
 
     def _submit_single_transaction_entry(
         self,
@@ -2312,13 +2333,13 @@ class MigrationEngine:
         checkpoint: CheckpointStore,
         report: Dict[str, Any],
         existing_import_map: Dict[str, str],
-    ) -> None:
+    ) -> bool:
         source_id = str(entry.get("source_id") or "")
         import_id = str(entry.get("import_id") or "")
         payload = entry.get("payload")
         source_tx = entry.get("tx") if isinstance(entry.get("tx"), dict) else {}
         if not source_id or not import_id or not isinstance(payload, dict):
-            return
+            return False
 
         try:
             response_data = self.dest_client.create_transactions(self.dest_plan_id, payload)
@@ -2329,6 +2350,7 @@ class MigrationEngine:
                 existing_import_map=existing_import_map,
                 report=report,
             )
+            return True
         except Exception as single_error:  # noqa: BLE001
             self._record_issue(
                 report,
@@ -2338,6 +2360,30 @@ class MigrationEngine:
                 f"single transaction failed: {summarize_exception(single_error)}",
                 details=self._transaction_issue_details(source_tx),
             )
+            return False
+
+    def _is_probable_batch_size_error(self, error: Exception) -> bool:
+        rendered = summarize_exception(error).lower()
+        if isinstance(error, YNABApiError):
+            if int(getattr(error, "status_code", 0) or 0) == 413:
+                return True
+            body = error.body if isinstance(error.body, dict) else {}
+            payload = ""
+            if isinstance(body.get("error"), dict):
+                err = body["error"]
+                payload = f"{err.get('name', '')} {err.get('detail', '')}".lower()
+            combined = f"{rendered} {payload}".strip()
+            if "data_limit_reached" in combined:
+                return True
+            if int(getattr(error, "status_code", 0) or 0) in (400, 403):
+                for token in ("too many", "maximum", "max ", "payload", "data limit", "data_limit"):
+                    if token in combined:
+                        return True
+            return False
+        for token in ("payload too large", "too many", "maximum", "data limit", "data_limit"):
+            if token in rendered:
+                return True
+        return False
 
     def _process_starting_balance_transaction(
         self,

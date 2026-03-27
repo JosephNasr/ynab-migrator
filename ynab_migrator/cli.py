@@ -38,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tx-batch-size",
         type=int,
-        default=1000,
+        default=10000,
         help=(
             "Target transaction create batch size. "
             "Large by default; oversized/invalid batches are automatically split."
