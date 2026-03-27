@@ -3,6 +3,12 @@
 This document is the operating manual for AI/code agents working on this repository.
 For operator usage and command examples, refer to `README.md`.
 
+## 0) Documentation Ownership
+
+- `README.md` is operator-facing and should contain runnable usage guidance.
+- `instructions.md` is implementation-facing and should contain architecture, invariants, and contributor/agent rules.
+- Avoid duplicating full command walkthroughs here unless needed to explain engineering behavior.
+
 ## 1) Project Goal
 
 `ynab-migrator` is a resumable Python CLI that migrates data from one YNAB plan to another using YNAB API v1 (`/plans/...` endpoints).
@@ -22,6 +28,7 @@ Primary goals:
 - Main commands: `plan`, `apply`, `verify`, `resume`
 - CLI parsing detail: global flags (for example `--source-token`, `--dest-token`, `--source-plan-id`, `--dest-plan-id`, `--workdir`) must appear before the subcommand.
 - Logging detail: `--verbose` (global flag) enables detailed technical API telemetry; default logging is human-readable progress.
+- `apply` UX detail: interactive Up/Down selector before execution chooses scope (`Everything` first). Selected scope auto-expands to include required dependencies.
 
 Quick local run:
 
@@ -109,6 +116,11 @@ Default workdir: `./.ynab_migrator`
 - Requires `snapshot.json`.
 - Initializes/uses checkpoint.
 - Enforces snapshot hash continuity with checkpoint metadata.
+- Resolves effective apply scope from:
+  - interactive CLI selection (for `apply` command), or
+  - stored checkpoint `apply_entities` (for resume continuity), or
+  - default `Everything` when non-interactive.
+- Dependency closure is automatic (for example selecting `transactions` includes `accounts`, `category_groups`, `categories`, `payees`).
 - Resolves destination internal system entities and pre-maps source internal IDs.
 - Runs stages in order:
   1. accounts
@@ -121,6 +133,7 @@ Default workdir: `./.ynab_migrator`
   8. scheduled transactions
   9. month category budget patches
 - Updates cursor after each processed item to support resume.
+- Transaction replay uses large write batches by default and recursive batch splitting on failures (instead of immediate one-by-one fallback), to keep calls close to endpoint batch capacity while isolating problematic payloads safely.
 - Creates accounts with opening balance `0`; balance comes from replayed transaction history.
 - For unsupported source account types, first attempts to map by exact destination account `name` + `type`; if no unique eligible match exists, creates as `cash` and records structured warnings/counters.
 - For source `Starting Balance` transactions, deletes one captured destination auto starting-balance transaction and then creates the source transaction to preserve original source date.

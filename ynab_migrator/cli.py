@@ -5,10 +5,15 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
+
+try:
+    import curses
+except Exception:  # noqa: BLE001
+    curses = None
 
 from .client import RetryConfig, YNABClient
-from .migration import MigrationEngine
+from .migration import MigrationEngine, get_apply_entity_prompt_options, resolve_apply_entities
 from .runtime_logging import build_runtime_logger, command_log_path
 
 
@@ -30,7 +35,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="./.ynab_migrator",
         help="Directory to store snapshot, checkpoint, and reports",
     )
-    parser.add_argument("--tx-batch-size", type=int, default=50, help="Transaction create batch size")
+    parser.add_argument(
+        "--tx-batch-size",
+        type=int,
+        default=1000,
+        help=(
+            "Target transaction create batch size. "
+            "Large by default; oversized/invalid batches are automatically split."
+        ),
+    )
     parser.add_argument(
         "--rate-limit-per-hour",
         type=int,
@@ -99,6 +112,112 @@ def _build_engine(args: argparse.Namespace, logger: logging.Logger) -> Migration
     )
 
 
+def _run_apply_selector_curses(options: List[Dict[str, Any]]) -> Optional[int]:
+    if curses is None:
+        return None
+
+    def _selector(stdscr: Any) -> Optional[int]:
+        selected_index = 0
+        stdscr.keypad(True)
+        try:
+            curses.curs_set(0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        while True:
+            stdscr.erase()
+            stdscr.addstr(0, 0, "Choose migration scope (Up/Down + Enter)")
+            stdscr.addstr(1, 0, "The chosen option will auto-include required dependencies.")
+            row = 3
+            for idx, option in enumerate(options):
+                detail = "all entities"
+                dependencies = option.get("dependencies") or []
+                if option.get("value") != "everything":
+                    if dependencies:
+                        detail = "includes: " + ", ".join(str(dep) for dep in dependencies)
+                    else:
+                        detail = "no dependencies"
+                line = f"{option.get('label')} ({detail})"
+                if idx == selected_index:
+                    stdscr.addstr(row, 0, f"> {line}", curses.A_REVERSE)
+                else:
+                    stdscr.addstr(row, 0, f"  {line}")
+                row += 1
+            stdscr.addstr(row + 1, 0, "Press q to cancel.")
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (curses.KEY_UP, ord("k"), ord("K")):
+                selected_index = (selected_index - 1) % len(options)
+                continue
+            if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                selected_index = (selected_index + 1) % len(options)
+                continue
+            if key in (10, 13, curses.KEY_ENTER):
+                return selected_index
+            if key in (ord("q"), ord("Q"), 27):
+                return None
+
+    return curses.wrapper(_selector)
+
+
+def _choose_apply_entities(logger: logging.Logger, as_json: bool) -> List[str]:
+    if as_json:
+        logger.info("Interactive apply scope prompt skipped in --json mode; defaulting to Everything.")
+        return ["everything"]
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        logger.info("Interactive apply scope prompt skipped (non-interactive terminal); defaulting to Everything.")
+        return ["everything"]
+    if curses is None:
+        logger.info("Interactive apply scope prompt unavailable on this platform; defaulting to Everything.")
+        return ["everything"]
+
+    prompt_options = get_apply_entity_prompt_options()
+    label_by_entity = {
+        option.get("entity"): option.get("label")
+        for option in prompt_options
+    }
+    options: List[Dict[str, Any]] = [
+        {
+            "value": "everything",
+            "label": "Everything",
+            "dependencies": [],
+        }
+    ]
+    for option in prompt_options:
+        entity = str(option.get("entity"))
+        dependency_labels = [
+            str(label_by_entity.get(dep, dep))
+            for dep in option.get("dependencies", [])
+        ]
+        options.append(
+            {
+                "value": entity,
+                "label": str(option.get("label", entity)),
+                "dependencies": dependency_labels,
+            }
+        )
+
+    selected_index = _run_apply_selector_curses(options)
+    if selected_index is None:
+        raise RuntimeError("apply cancelled by user before execution")
+
+    selection = str(options[selected_index]["value"])
+    effective_entities = resolve_apply_entities([selection])
+    print(
+        "apply scope: "
+        + str(options[selected_index]["label"])
+        + " -> "
+        + ", ".join(effective_entities)
+    )
+    logger.info(
+        "Apply scope selected: %s (effective entities: %s)",
+        selection,
+        ",".join(effective_entities),
+    )
+    return [selection]
+
+
 def _emit(report: Dict[str, Any], as_json: bool) -> None:
     if as_json:
         print(json.dumps(report, indent=2, sort_keys=True, ensure_ascii=True))
@@ -126,6 +245,9 @@ def _emit(report: Dict[str, Any], as_json: bool) -> None:
             print(f"{severity}: {action}")
     elif mode == "apply":
         mapping_counts = report.get("mapping_counts", {})
+        apply_entities = report.get("apply_entities", [])
+        if isinstance(apply_entities, list) and apply_entities:
+            print(f"apply entities: {', '.join(str(item) for item in apply_entities)}")
         print(f"mapped transactions: {mapping_counts.get('transactions', 0)}")
         print(f"mapped scheduled transactions: {mapping_counts.get('scheduled_transactions', 0)}")
         print(f"errors: {len(report.get('errors', []))}")
@@ -154,7 +276,8 @@ def main(argv: Any = None) -> int:
         if args.command == "plan":
             report = engine.plan()
         elif args.command == "apply":
-            report = engine.apply()
+            selected_entities = _choose_apply_entities(logger=logger.getChild("cli"), as_json=bool(args.json))
+            report = engine.apply(selected_entities=selected_entities)
         elif args.command == "verify":
             report = engine.verify()
         elif args.command == "resume":

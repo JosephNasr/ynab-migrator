@@ -1,24 +1,19 @@
 # ynab-migrator
 
-Note: This codebase is fully written by codex.
+Resumable CLI to migrate YNAB data from one plan to another using the public API.
 
-Resumable Python CLI to migrate YNAB data from one plan to another via the public API.
+## Documentation Split
 
-## Guarantees and Safety
+- `README.md`: operator usage (install, run, artifacts, troubleshooting)
+- `instructions.md`: engineering/agent source of truth (architecture, invariants, implementation behavior)
 
-- Uses a strict extraction filter: any entity with `deleted=true` (or tombstone-like status) is ignored and is never replayed.
-- Uses checkpointed execution (`checkpoint.sqlite3`) so runs can resume safely after interruption.
-- Uses deterministic transaction `import_id` values to support idempotent replay and duplicate protection.
-- Uses automatic throttling for YNAB rate limits (`200 requests/hour` per token by default).
-- Auto-maps source system-managed groups (`Internal Master Category`, `Hidden Categories`, `Credit Card Payments`) to destination system groups and does not recreate them.
-- Auto-maps source internal categories (`Inflow: Ready to Assign`, `Uncategorized`) and credit-card payment categories by exact name in destination `Credit Card Payments`.
-- Creates destination accounts with opening balance `0`; balances are established by replayed transactions (including `Starting Balance`).
-- For unsupported source account types, first tries to reuse an existing destination account by exact name + exact type; if no unique eligible match exists, creates as `cash` (warning + report counters emitted).
-- Captures and deletes destination auto-generated `Starting Balance` transactions, then recreates source `Starting Balance` transactions with original source date/amount/memo/flags.
-- Records account notes and month notes as non-migratable read-only fields and reports them explicitly.
-- Emits human-readable runtime logs to console and workdir log files (`plan.log`, `apply.log`, `verify.log`, `resume.log`), overwritten each run.
-- Use `--verbose` for detailed technical API telemetry (request/retry/backoff diagnostics).
-- Produces JSON reports for planning, apply, and verification phases.
+## Core Safety Guarantees
+
+- Deleted/tombstoned entities are filtered and never replayed.
+- Migration is resumable via `checkpoint.sqlite3`.
+- Transaction replay is idempotent with deterministic `import_id` values.
+- Account balances are rebuilt from transaction history (accounts created with `balance=0`).
+- Runtime logs are always written (`plan.log`, `apply.log`, `verify.log`, `resume.log`).
 
 ## Install
 
@@ -26,14 +21,18 @@ Resumable Python CLI to migrate YNAB data from one plan to another via the publi
 pip install -e .
 ```
 
-## Commands
+## Quickstart
 
-All commands require both source and destination tokens and plan IDs.
-Global options must be placed before the subcommand (`plan`/`apply`/`verify`/`resume`).
-Use `--verbose` (before subcommand) to enable detailed technical logs.
-For implementation-level behavior details, use `instructions.md` as the source of truth.
+Set your credentials/IDs first:
 
-### 1) Build snapshot and preflight
+```bash
+export YNAB_SOURCE_TOKEN="..."
+export YNAB_DEST_TOKEN="..."
+export YNAB_SOURCE_PLAN_ID="..."
+export YNAB_DEST_PLAN_ID="..."
+```
+
+Run `plan`:
 
 ```bash
 ynab-migrator \
@@ -45,13 +44,7 @@ ynab-migrator \
   plan
 ```
 
-Outputs:
-
-- `.ynab_migrator/snapshot.json`
-- `.ynab_migrator/plan_report.json`
-- `.ynab_migrator/plan.log`
-
-### 2) Apply migration
+Run `apply`:
 
 ```bash
 ynab-migrator \
@@ -63,13 +56,7 @@ ynab-migrator \
   apply
 ```
 
-Outputs:
-
-- `.ynab_migrator/checkpoint.sqlite3`
-- `.ynab_migrator/apply_report.json`
-- `.ynab_migrator/apply.log`
-
-### 3) Verify parity for migrated subset
+Run `verify`:
 
 ```bash
 ynab-migrator \
@@ -81,12 +68,7 @@ ynab-migrator \
   verify
 ```
 
-Outputs:
-
-- `.ynab_migrator/verify_report.json`
-- `.ynab_migrator/verify.log`
-
-### 4) Resume
+Resume interrupted apply:
 
 ```bash
 ynab-migrator \
@@ -98,41 +80,37 @@ ynab-migrator \
   resume
 ```
 
-`resume` is an alias for `apply`, using existing checkpoint state.
-It writes `.ynab_migrator/resume.log`.
+## Apply Scope Selector
 
-## Notes
+`apply` starts with an interactive scope selector:
 
-- Destination plan must already exist (YNAB API does not expose plan creation).
-- Some API resources are read-only and cannot be recreated exactly (for example payee locations and money movements). These are reported.
-- Split scheduled transactions are not writable via current API write schemas and are excluded with explicit warnings.
-- Destination must contain exactly one of each required system-managed group: `Internal Master Category`, `Hidden Categories`, `Credit Card Payments`.
-- Destination internal group must contain exactly one `Inflow: Ready to Assign` and one `Uncategorized`.
-- Destination `Credit Card Payments` group must contain each source credit-card payment category by exact name.
-- If you upgrade from an older migrator snapshot/checkpoint format, rerun from a fresh workdir (`plan` first).
+- Up/Down + Enter
+- first option: `Everything`
+- narrower scopes auto-include required dependencies
+- non-interactive terminals and `--json` default to `Everything`
+
+## Artifacts (`--workdir`)
+
+- `snapshot.json`
+- `plan_report.json`
+- `apply_report.json`
+- `verify_report.json`
+- `checkpoint.sqlite3`
+- `plan.log`, `apply.log`, `verify.log`, `resume.log`
+
+## Important Limitations
+
+- Destination plan must already exist.
+- Account notes and month notes are read-only in current YNAB API (reported, not written).
+- Split scheduled transactions are not writable via current API write schema.
+- Some system entities must already exist in destination (`Internal Master Category`, `Hidden Categories`, `Credit Card Payments`, internal inflow/uncategorized).
 
 ## Troubleshooting
 
-- Required arg error (`--source-token`, `--dest-token`, etc.): place global flags before the subcommand.
-- Account create behavior: all source accounts first try exact destination name+type reuse; if no unique match exists, migrator creates a new account. Unsupported source account types still fall back to `cash` and log structured warnings in `apply_report.json`.
-- System entity mapping error: destination must have exactly one `Internal Master Category`, `Hidden Categories`, `Credit Card Payments`, `Inflow: Ready to Assign`, and `Uncategorized`.
-- Verify account type mismatch: use the same migrator version for `apply` and `verify`, and verify against the same snapshot/checkpoint pair.
+- Put global flags before subcommand (`plan`/`apply`/`verify`/`resume`).
+- If snapshot/checkpoint mismatch errors appear, rerun from a clean workdir.
+- If system-entity mapping errors appear, verify required system groups/categories exist exactly once in destination.
 
-## Report Quick Reference
+## Advanced / Internal Behavior
 
-- `plan_report.json`
-  - `stats.source_counts_after_deleted_filter`: source entity counts used for migration.
-  - `stats.estimated_apply_requests`: rough request volume and duration estimate.
-  - `manual_action_items`: explicit pre/post apply operator actions to maximize migration parity.
-- `apply_report.json`
-  - `mapping_counts`: how many entities were successfully mapped.
-  - `warnings` / `errors`: per-entity issues and non-fatal behavior changes.
-  - `system_entity_stats.reused_accounts_by_name_type`: accounts mapped to existing destination accounts by exact name+type before creation.
-  - `system_entity_stats.ambiguous_account_name_type_matches`: accounts where multiple exact destination name+type matches were found (new account created to avoid incorrect mapping).
-  - `system_entity_stats.coerced_account_types`: number of accounts coerced to `cash`.
-  - `system_entity_stats.reused_unsupported_accounts_by_name_type`: number of unsupported accounts mapped to existing destination accounts by exact name+type.
-  - `system_entity_stats.ambiguous_unsupported_account_name_type_matches`: unsupported accounts with multiple exact destination name+type candidates (fallback to `cash`).
-  - `system_entity_stats.skipped_missing_month_budget_targets`: month budget entries excluded when destination month/category targets are not available (`404`).
-- `verify_report.json`
-  - `passed`: overall parity status.
-  - `mismatch_count` + `mismatches`: parity failures with expected/actual payloads.
+For implementation details, invariants, and change guidelines, use `instructions.md`.

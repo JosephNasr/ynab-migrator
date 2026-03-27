@@ -39,6 +39,101 @@ INTERNAL_UNCATEGORIZED_CATEGORY_NAME = "Uncategorized"
 STARTING_BALANCE_PAYEE_NAME = "Starting Balance"
 SUPPORTED_ACCOUNT_CREATE_TYPES = {"checking", "savings", "cash", "creditCard"}
 ALLOWED_FLAG_COLORS = {"red", "orange", "yellow", "green", "blue", "purple"}
+APPLY_ENTITY_EXECUTION_ORDER: Tuple[str, ...] = (
+    "accounts",
+    "category_groups",
+    "categories",
+    "payees",
+    "transactions",
+    "scheduled_transactions",
+    "month_budgets",
+)
+APPLY_ENTITY_LABELS: Dict[str, str] = {
+    "accounts": "Accounts",
+    "category_groups": "Category Groups",
+    "categories": "Categories",
+    "payees": "Payees",
+    "transactions": "Transactions",
+    "scheduled_transactions": "Scheduled Transactions",
+    "month_budgets": "Month Budgets",
+}
+APPLY_ENTITY_DEPENDENCIES: Dict[str, Set[str]] = {
+    "accounts": set(),
+    "category_groups": set(),
+    "categories": {"accounts", "category_groups"},
+    "payees": set(),
+    "transactions": {"accounts", "categories", "payees"},
+    "scheduled_transactions": {"accounts", "categories", "payees"},
+    "month_budgets": {"categories"},
+}
+
+
+def _apply_entity_closure(entity: str, visited: Optional[Set[str]] = None) -> Set[str]:
+    if entity not in APPLY_ENTITY_DEPENDENCIES:
+        raise ValueError(
+            "unknown apply entity scope "
+            f"'{entity}'. Supported values: {', '.join(APPLY_ENTITY_EXECUTION_ORDER)}"
+        )
+    if visited is None:
+        visited = set()
+    if entity in visited:
+        return visited
+    visited.add(entity)
+    for dependency in APPLY_ENTITY_DEPENDENCIES[entity]:
+        _apply_entity_closure(dependency, visited)
+    return visited
+
+
+def resolve_apply_entities(selected_entities: Optional[Iterable[str]]) -> List[str]:
+    if selected_entities is None:
+        return list(APPLY_ENTITY_EXECUTION_ORDER)
+
+    normalized: List[str] = []
+    for raw in selected_entities:
+        if raw is None:
+            continue
+        token = str(raw).strip().lower()
+        if not token:
+            continue
+        if token in {"everything", "all", "*"}:
+            return list(APPLY_ENTITY_EXECUTION_ORDER)
+        normalized.append(token)
+
+    if not normalized:
+        return list(APPLY_ENTITY_EXECUTION_ORDER)
+
+    scoped: Set[str] = set()
+    for token in normalized:
+        scoped.update(_apply_entity_closure(token))
+
+    return [entity for entity in APPLY_ENTITY_EXECUTION_ORDER if entity in scoped]
+
+
+def get_apply_entity_prompt_options() -> List[Dict[str, Any]]:
+    execution_index = {name: index for index, name in enumerate(APPLY_ENTITY_EXECUTION_ORDER)}
+    entities_sorted = sorted(
+        APPLY_ENTITY_EXECUTION_ORDER,
+        key=lambda name: (
+            max(0, len(_apply_entity_closure(name)) - 1),
+            execution_index[name],
+        ),
+    )
+
+    options: List[Dict[str, Any]] = []
+    for entity in entities_sorted:
+        dependencies = [
+            dependency
+            for dependency in APPLY_ENTITY_EXECUTION_ORDER
+            if dependency in _apply_entity_closure(entity) and dependency != entity
+        ]
+        options.append(
+            {
+                "entity": entity,
+                "label": APPLY_ENTITY_LABELS.get(entity, entity),
+                "dependencies": dependencies,
+            }
+        )
+    return options
 
 
 def _today_utc() -> date:
@@ -370,7 +465,8 @@ class MigrationEngine:
         )
         return report
 
-    def apply(self) -> Dict[str, Any]:
+    def apply(self, selected_entities: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        requested_apply_entities = resolve_apply_entities(selected_entities)
         self._log_stage(
             "apply",
             "command",
@@ -378,6 +474,7 @@ class MigrationEngine:
             source_plan_id=self.source_plan_id,
             dest_plan_id=self.dest_plan_id,
             workdir=self.paths.workdir,
+            requested_entities=",".join(requested_apply_entities),
         )
         snapshot = self._load_snapshot()
         checkpoint = CheckpointStore(self.paths.checkpoint_path)
@@ -405,6 +502,49 @@ class MigrationEngine:
                         "checkpoint schema version is incompatible; rerun from a clean workdir"
                     )
 
+            existing_apply_entities_raw = checkpoint.get_metadata("apply_entities")
+            existing_apply_entities: List[str] = []
+            if isinstance(existing_apply_entities_raw, list) and existing_apply_entities_raw:
+                existing_apply_entities = resolve_apply_entities(existing_apply_entities_raw)
+            elif existing_apply_entities_raw not in (None, [], ()):
+                raise RuntimeError("checkpoint apply_entities metadata is invalid; rerun from a clean workdir")
+
+            if existing_apply_entities:
+                if selected_entities is None:
+                    effective_apply_entities = existing_apply_entities
+                else:
+                    requested_set = set(requested_apply_entities)
+                    existing_set = set(existing_apply_entities)
+                    if requested_set == existing_set:
+                        effective_apply_entities = existing_apply_entities
+                    elif requested_set.issuperset(existing_set):
+                        effective_apply_entities = [
+                            entity
+                            for entity in APPLY_ENTITY_EXECUTION_ORDER
+                            if entity in requested_set
+                        ]
+                        checkpoint.set_metadata("apply_entities", effective_apply_entities)
+                        checkpoint.add_event(
+                            "INFO",
+                            "expanded apply_entities scope to " + ",".join(effective_apply_entities),
+                        )
+                    else:
+                        raise RuntimeError(
+                            "requested apply entity scope conflicts with checkpoint scope; "
+                            "use `resume` to continue checkpoint scope or rerun with a clean workdir"
+                        )
+            else:
+                effective_apply_entities = requested_apply_entities
+                checkpoint.set_metadata("apply_entities", effective_apply_entities)
+
+            effective_apply_entity_set = set(effective_apply_entities)
+            self._log_stage(
+                "apply",
+                "entity_scope",
+                "complete",
+                entities=",".join(effective_apply_entities),
+            )
+
             source_system_entities = snapshot["system_entities"]
             non_migratable_fields = snapshot.get("non_migratable_fields", {})
             account_note_count = len(non_migratable_fields.get("account_notes", []))
@@ -416,6 +556,7 @@ class MigrationEngine:
                 "dest_plan_id": self.dest_plan_id,
                 "warnings": [],
                 "errors": [],
+                "apply_entities": effective_apply_entities,
                 "exclusions": checkpoint.get_metadata("exclusions", []),
                 "non_migratable_fields": non_migratable_fields,
                 "system_entity_stats": {
@@ -458,8 +599,12 @@ class MigrationEngine:
                     "reused_unsupported_accounts_by_name_type": 0,
                     "ambiguous_account_name_type_matches": 0,
                     "ambiguous_unsupported_account_name_type_matches": 0,
+                    "reused_category_groups_by_name": 0,
+                    "ambiguous_category_group_name_matches": 0,
                     "reused_categories_by_name_group": 0,
                     "ambiguous_category_name_group_matches": 0,
+                    "reused_payees_by_exact_name": 0,
+                    "ambiguous_payee_exact_name_matches": 0,
                 },
             }
             if account_note_count:
@@ -498,90 +643,131 @@ class MigrationEngine:
                 source_system_entities["source_credit_card_payment_category_ids"]
             )
 
-            self._log_stage("apply", "resolve_system_entities_pre_accounts", "start")
-            self._resolve_and_map_destination_system_entities(
-                source_system_entities=source_system_entities,
-                checkpoint=checkpoint,
-                report=report,
-                map_credit_card_payment_categories=False,
+            needs_system_group_mapping = bool(
+                effective_apply_entity_set.intersection(
+                    {
+                        "category_groups",
+                        "categories",
+                        "transactions",
+                        "scheduled_transactions",
+                        "month_budgets",
+                    }
+                )
             )
-            self._log_stage("apply", "resolve_system_entities_pre_accounts", "complete")
-            self._log_stage("apply", "accounts", "start", total=len(source_accounts))
-            self._create_accounts(source_accounts, checkpoint, report)
-            self._log_stage("apply", "accounts", "complete")
-            self._log_stage("apply", "resolve_system_entities_post_accounts", "start")
-            self._resolve_and_map_destination_system_entities(
-                source_system_entities=source_system_entities,
-                checkpoint=checkpoint,
-                report=report,
-                map_credit_card_payment_categories=True,
+            needs_system_category_mapping = bool(
+                effective_apply_entity_set.intersection(
+                    {
+                        "categories",
+                        "transactions",
+                        "scheduled_transactions",
+                        "month_budgets",
+                    }
+                )
             )
-            self._log_stage("apply", "resolve_system_entities_post_accounts", "complete")
-            self._log_stage("apply", "capture_auto_starting_balance", "start")
-            self._capture_destination_auto_starting_balance_candidates(
-                source_accounts=source_accounts,
-                checkpoint=checkpoint,
-                report=report,
-            )
-            self._log_stage("apply", "capture_auto_starting_balance", "complete")
-            self._log_stage("apply", "category_groups", "start", total=len(source_category_groups))
-            self._create_category_groups(
-                source_groups=source_category_groups,
-                checkpoint=checkpoint,
-                report=report,
-                source_system_group_ids=source_system_group_ids,
-            )
-            self._log_stage("apply", "category_groups", "complete")
-            self._log_stage("apply", "categories", "start", total=len(source_categories))
-            self._create_categories(
-                source_categories=source_categories,
-                checkpoint=checkpoint,
-                report=report,
-                source_system_category_ids=source_system_category_ids,
-            )
-            self._log_stage("apply", "categories", "complete")
-            self._log_stage("apply", "payees", "start", total=len(source_payees))
-            self._seed_payee_name_mappings(source_payees, checkpoint, report)
-            self._log_stage("apply", "payees", "complete")
-            self._log_stage("apply", "transactions", "start", total=len(source_transactions))
-            self._create_transactions(
-                source_transactions,
-                source_accounts_by_id,
-                source_payees_by_id,
-                checkpoint,
-                report,
-            )
-            self._log_stage("apply", "transactions", "complete")
-            self._log_stage("apply", "payees_refresh", "start", total=len(source_payees))
-            self._seed_payee_name_mappings(source_payees, checkpoint, report)
-            self._log_stage("apply", "payees_refresh", "complete")
-            self._log_stage(
-                "apply",
-                "scheduled_transactions",
-                "start",
-                total=len(source_scheduled_transactions),
-            )
-            self._create_scheduled_transactions(
-                source_scheduled_transactions,
-                source_accounts_by_id,
-                source_payees_by_id,
-                checkpoint,
-                report,
-            )
-            self._log_stage("apply", "scheduled_transactions", "complete")
-            self._log_stage(
-                "apply",
-                "month_budgets",
-                "start",
-                total=len(month_category_budgets),
-            )
-            self._apply_month_budgets(
-                month_category_budgets=month_category_budgets,
-                checkpoint=checkpoint,
-                report=report,
-                source_internal_category_ids=source_internal_category_ids,
-            )
-            self._log_stage("apply", "month_budgets", "complete")
+
+            if needs_system_group_mapping:
+                self._log_stage("apply", "resolve_system_entities_pre_accounts", "start")
+                self._resolve_and_map_destination_system_entities(
+                    source_system_entities=source_system_entities,
+                    checkpoint=checkpoint,
+                    report=report,
+                    map_credit_card_payment_categories=False,
+                )
+                self._log_stage("apply", "resolve_system_entities_pre_accounts", "complete")
+
+            if "accounts" in effective_apply_entity_set:
+                self._log_stage("apply", "accounts", "start", total=len(source_accounts))
+                self._create_accounts(source_accounts, checkpoint, report)
+                self._log_stage("apply", "accounts", "complete")
+
+            if needs_system_category_mapping:
+                self._log_stage("apply", "resolve_system_entities_post_accounts", "start")
+                self._resolve_and_map_destination_system_entities(
+                    source_system_entities=source_system_entities,
+                    checkpoint=checkpoint,
+                    report=report,
+                    map_credit_card_payment_categories=True,
+                )
+                self._log_stage("apply", "resolve_system_entities_post_accounts", "complete")
+
+            if "transactions" in effective_apply_entity_set:
+                self._log_stage("apply", "capture_auto_starting_balance", "start")
+                self._capture_destination_auto_starting_balance_candidates(
+                    source_accounts=source_accounts,
+                    checkpoint=checkpoint,
+                    report=report,
+                )
+                self._log_stage("apply", "capture_auto_starting_balance", "complete")
+
+            if "category_groups" in effective_apply_entity_set:
+                self._log_stage("apply", "category_groups", "start", total=len(source_category_groups))
+                self._create_category_groups(
+                    source_groups=source_category_groups,
+                    checkpoint=checkpoint,
+                    report=report,
+                    source_system_group_ids=source_system_group_ids,
+                )
+                self._log_stage("apply", "category_groups", "complete")
+
+            if "categories" in effective_apply_entity_set:
+                self._log_stage("apply", "categories", "start", total=len(source_categories))
+                self._create_categories(
+                    source_categories=source_categories,
+                    checkpoint=checkpoint,
+                    report=report,
+                    source_system_category_ids=source_system_category_ids,
+                )
+                self._log_stage("apply", "categories", "complete")
+
+            if "payees" in effective_apply_entity_set:
+                self._log_stage("apply", "payees", "start", total=len(source_payees))
+                self._seed_payee_name_mappings(source_payees, checkpoint, report)
+                self._log_stage("apply", "payees", "complete")
+
+            if "transactions" in effective_apply_entity_set:
+                self._log_stage("apply", "transactions", "start", total=len(source_transactions))
+                self._create_transactions(
+                    source_transactions,
+                    source_accounts_by_id,
+                    source_payees_by_id,
+                    checkpoint,
+                    report,
+                )
+                self._log_stage("apply", "transactions", "complete")
+
+            if "scheduled_transactions" in effective_apply_entity_set:
+                self._log_stage("apply", "payees_refresh", "start", total=len(source_payees))
+                self._seed_payee_name_mappings(source_payees, checkpoint, report)
+                self._log_stage("apply", "payees_refresh", "complete")
+                self._log_stage(
+                    "apply",
+                    "scheduled_transactions",
+                    "start",
+                    total=len(source_scheduled_transactions),
+                )
+                self._create_scheduled_transactions(
+                    source_scheduled_transactions,
+                    source_accounts_by_id,
+                    source_payees_by_id,
+                    checkpoint,
+                    report,
+                )
+                self._log_stage("apply", "scheduled_transactions", "complete")
+
+            if "month_budgets" in effective_apply_entity_set:
+                self._log_stage(
+                    "apply",
+                    "month_budgets",
+                    "start",
+                    total=len(month_category_budgets),
+                )
+                self._apply_month_budgets(
+                    month_category_budgets=month_category_budgets,
+                    checkpoint=checkpoint,
+                    report=report,
+                    source_internal_category_ids=source_internal_category_ids,
+                )
+                self._log_stage("apply", "month_budgets", "complete")
 
             report["mapping_counts"] = {
                 "accounts": len(checkpoint.list_mappings("account")),
@@ -1532,6 +1718,21 @@ class MigrationEngine:
         cursor_name = "category_groups_idx"
         cursor = checkpoint.get_cursor(cursor_name)
         groups = sorted(source_groups, key=lambda item: (item.get("name") or "", item.get("id") or ""))
+        destination_plan = self.dest_client.get_plan(self.dest_plan_id).get("plan", {})
+        destination_groups = clean_deleted(destination_plan.get("category_groups", []))
+        destination_groups_by_name: Dict[str, List[Dict[str, Any]]] = {}
+        for destination_group in destination_groups:
+            destination_id = destination_group.get("id")
+            destination_name = destination_group.get("name")
+            if not destination_id or not isinstance(destination_name, str):
+                continue
+            destination_groups_by_name.setdefault(destination_name, []).append(destination_group)
+
+        existing_group_map = checkpoint.get_mapping_dict("category_group")
+        used_destination_group_ids: Set[str] = {
+            str(dest_id) for dest_id in existing_group_map.values() if dest_id
+        }
+
         for idx in range(cursor, len(groups)):
             self._log_progress("apply", "category_groups", idx + 1, len(groups))
             group = groups[idx]
@@ -1547,6 +1748,54 @@ class MigrationEngine:
                     self._increment_system_counter(report, "skipped_system_category_group_creates")
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
+
+            group_name = group.get("name")
+            if isinstance(group_name, str):
+                existing_matches = destination_groups_by_name.get(group_name, [])
+                if len(existing_matches) == 1:
+                    existing_dest_id = str(existing_matches[0].get("id"))
+                    if existing_dest_id in used_destination_group_ids:
+                        self._record_issue(
+                            report,
+                            "warnings",
+                            "category_group",
+                            source_id,
+                            "exact destination category group name match already mapped; creating new category group",
+                            details={
+                                "category_group_name": group_name,
+                                "matched_destination_category_group_id": existing_dest_id,
+                            },
+                        )
+                        self._increment_system_counter(report, "ambiguous_category_group_name_matches")
+                    else:
+                        checkpoint.set_mapping("category_group", source_id, existing_dest_id)
+                        used_destination_group_ids.add(existing_dest_id)
+                        checkpoint.add_event(
+                            "INFO",
+                            f"category_group mapped {source_id} -> {existing_dest_id} "
+                            "(reused existing destination category group by exact name)",
+                        )
+                        self._increment_system_counter(report, "reused_category_groups_by_name")
+                        checkpoint.set_cursor(cursor_name, idx + 1)
+                        continue
+                elif len(existing_matches) > 1:
+                    self._record_issue(
+                        report,
+                        "warnings",
+                        "category_group",
+                        source_id,
+                        "multiple destination category groups matched exact name; creating new category group",
+                        details={
+                            "category_group_name": group_name,
+                            "matched_destination_category_group_ids": [
+                                str(match.get("id"))
+                                for match in existing_matches
+                                if match.get("id")
+                            ],
+                        },
+                    )
+                    self._increment_system_counter(report, "ambiguous_category_group_name_matches")
+
             payload = {"name": group.get("name")}
             try:
                 created = self.dest_client.create_category_group(self.dest_plan_id, payload).get(
@@ -1556,6 +1805,9 @@ class MigrationEngine:
                 if not dest_id:
                     raise RuntimeError("category group response missing id")
                 checkpoint.set_mapping("category_group", source_id, dest_id)
+                used_destination_group_ids.add(str(dest_id))
+                if isinstance(payload.get("name"), str):
+                    destination_groups_by_name.setdefault(payload["name"], []).append(created)
                 checkpoint.add_event("INFO", f"category_group mapped {source_id} -> {dest_id}")
             except Exception as error:  # noqa: BLE001
                 self._record_issue(
@@ -1744,7 +1996,16 @@ class MigrationEngine:
         for payee in destination_payees:
             if payee.get("transfer_account_id"):
                 continue
-            by_name.setdefault(normalize_name(payee.get("name")), []).append(payee)
+            destination_id = payee.get("id")
+            destination_name = payee.get("name")
+            if not destination_id or not isinstance(destination_name, str):
+                continue
+            by_name.setdefault(destination_name, []).append(payee)
+
+        existing_payee_map = checkpoint.get_mapping_dict("payee")
+        used_destination_payee_ids: Set[str] = {
+            str(dest_id) for dest_id in existing_payee_map.values() if dest_id
+        }
 
         for source_payee in source_payees:
             if is_deleted(source_payee):
@@ -1757,19 +2018,39 @@ class MigrationEngine:
             if checkpoint.get_mapping("payee", source_id):
                 continue
 
-            matches = by_name.get(normalize_name(source_payee.get("name")), [])
+            source_name = source_payee.get("name")
+            if not isinstance(source_name, str):
+                continue
+            matches = by_name.get(source_name, [])
             if len(matches) == 1:
-                checkpoint.set_mapping("payee", source_id, matches[0]["id"])
-                checkpoint.add_event("INFO", f"payee mapped by name {source_id} -> {matches[0]['id']}")
+                matched_dest_id = str(matches[0].get("id"))
+                if matched_dest_id in used_destination_payee_ids:
+                    self._record_issue(
+                        report,
+                        "warnings",
+                        "payee",
+                        source_id,
+                        "exact destination payee name match already mapped; leaving unmapped",
+                        details={
+                            "payee_name": source_name,
+                            "matched_destination_payee_id": matched_dest_id,
+                        },
+                    )
+                    self._increment_system_counter(report, "ambiguous_payee_exact_name_matches")
+                    continue
+                checkpoint.set_mapping("payee", source_id, matched_dest_id)
+                used_destination_payee_ids.add(matched_dest_id)
+                checkpoint.add_event("INFO", f"payee mapped by exact name {source_id} -> {matched_dest_id}")
+                self._increment_system_counter(report, "reused_payees_by_exact_name")
             elif len(matches) > 1:
                 self._record_issue(
                     report,
                     "warnings",
                     "payee",
                     source_id,
-                    "multiple destination payees matched by name; leaving unmapped",
+                    "multiple destination payees matched exact name; leaving unmapped",
                     details={
-                        "payee_name": source_payee.get("name"),
+                        "payee_name": source_name,
                         "matched_destination_payee_ids": [
                             str(item.get("id"))
                             for item in matches
@@ -1777,6 +2058,7 @@ class MigrationEngine:
                         ],
                     },
                 )
+                self._increment_system_counter(report, "ambiguous_payee_exact_name_matches")
 
     def _create_transactions(
         self,
@@ -1794,16 +2076,10 @@ class MigrationEngine:
         account_map = checkpoint.get_mapping_dict("account")
         category_map = checkpoint.get_mapping_dict("category")
         payee_map = checkpoint.get_mapping_dict("payee")
-        tx_by_id = {
-            tx.get("id"): tx
-            for tx in transactions
-            if isinstance(tx, dict) and tx.get("id")
-        }
 
         while cursor < len(transactions):
             self._log_progress("apply", "transactions", cursor + 1, len(transactions))
-            batch_payloads: List[Dict[str, Any]] = []
-            batch_meta: List[Tuple[str, str]] = []
+            batch_entries: List[Dict[str, Any]] = []
             scan_idx = cursor
             while scan_idx < len(transactions):
                 self._log_progress("apply", "transactions", scan_idx + 1, len(transactions))
@@ -1835,7 +2111,7 @@ class MigrationEngine:
 
                 if self._is_starting_balance_transaction(tx, source_payees_by_id):
                     # Preserve ordering while keeping batch efficiency for non-starting-balance entries.
-                    if batch_payloads:
+                    if batch_entries:
                         break
                     self._process_starting_balance_transaction(
                         tx=tx,
@@ -1878,85 +2154,133 @@ class MigrationEngine:
                     continue
 
                 payload["import_id"] = import_id
-                batch_payloads.append(payload)
-                batch_meta.append((source_id, import_id))
+                batch_entries.append(
+                    {
+                        "source_id": source_id,
+                        "import_id": import_id,
+                        "payload": payload,
+                        "tx": tx,
+                    }
+                )
                 scan_idx += 1
-                if len(batch_payloads) >= self.tx_batch_size:
+                if len(batch_entries) >= self.tx_batch_size:
                     break
 
-            if not batch_payloads:
+            if not batch_entries:
                 continue
 
-            source_by_import = {import_id: source_id for source_id, import_id in batch_meta}
-            try:
-                response_data = self.dest_client.create_transactions(self.dest_plan_id, batch_payloads)
-                self._apply_transaction_batch_response(
-                    checkpoint=checkpoint,
-                    response_data=response_data,
-                    source_by_import=source_by_import,
-                    existing_import_map=existing_import_map,
-                    report=report,
-                )
-            except Exception as batch_error:  # noqa: BLE001
-                # Fallback one-by-one for clearer error isolation.
-                self._record_issue(
-                    report,
-                    "warnings",
-                    "transaction_batch",
-                    None,
-                    f"batch failed, retrying individually: {summarize_exception(batch_error)}",
-                    details={
-                        "batch_size": len(batch_meta),
-                        "first_source_transaction_id": batch_meta[0][0] if batch_meta else None,
-                        "last_source_transaction_id": batch_meta[-1][0] if batch_meta else None,
-                    },
-                )
-                for source_id, import_id in batch_meta:
-                    tx = tx_by_id.get(source_id)
-                    if not tx:
-                        continue
-                    payload, error = self._build_transaction_payload(
-                        tx=tx,
-                        source_accounts_by_id=source_accounts_by_id,
-                        source_payees_by_id=source_payees_by_id,
-                        account_map=account_map,
-                        category_map=category_map,
-                        payee_map=payee_map,
-                        include_import_id=True,
-                        report=report,
-                    )
-                    if payload is None:
-                        self._record_issue(
-                            report,
-                            "errors",
-                            "transaction",
-                            source_id,
-                            error or "payload build failed",
-                            details=self._transaction_issue_details(tx),
-                        )
-                        continue
-                    payload["import_id"] = import_id
-                    try:
-                        response_data = self.dest_client.create_transactions(self.dest_plan_id, payload)
-                        self._apply_transaction_batch_response(
-                            checkpoint=checkpoint,
-                            response_data=response_data,
-                            source_by_import={import_id: source_id},
-                            existing_import_map=existing_import_map,
-                            report=report,
-                        )
-                    except Exception as single_error:  # noqa: BLE001
-                        self._record_issue(
-                            report,
-                            "errors",
-                            "transaction",
-                            source_id,
-                            f"single transaction failed: {summarize_exception(single_error)}",
-                            details=self._transaction_issue_details(tx),
-                        )
+            self._submit_transaction_batch_entries(
+                batch_entries=batch_entries,
+                checkpoint=checkpoint,
+                report=report,
+                existing_import_map=existing_import_map,
+            )
 
             cursor = scan_idx
             checkpoint.set_cursor(cursor_name, cursor)
+
+    def _submit_transaction_batch_entries(
+        self,
+        batch_entries: List[Dict[str, Any]],
+        checkpoint: CheckpointStore,
+        report: Dict[str, Any],
+        existing_import_map: Dict[str, str],
+    ) -> None:
+        if not batch_entries:
+            return
+
+        if len(batch_entries) == 1:
+            self._submit_single_transaction_entry(
+                entry=batch_entries[0],
+                checkpoint=checkpoint,
+                report=report,
+                existing_import_map=existing_import_map,
+            )
+            return
+
+        source_by_import = {
+            str(entry["import_id"]): str(entry["source_id"])
+            for entry in batch_entries
+            if entry.get("import_id") and entry.get("source_id")
+        }
+        payloads = [
+            dict(entry["payload"])
+            for entry in batch_entries
+            if isinstance(entry.get("payload"), dict)
+        ]
+        if not payloads:
+            return
+
+        try:
+            response_data = self.dest_client.create_transactions(self.dest_plan_id, payloads)
+            self._apply_transaction_batch_response(
+                checkpoint=checkpoint,
+                response_data=response_data,
+                source_by_import=source_by_import,
+                existing_import_map=existing_import_map,
+                report=report,
+            )
+            return
+        except Exception as batch_error:  # noqa: BLE001
+            self._record_issue(
+                report,
+                "warnings",
+                "transaction_batch",
+                None,
+                f"batch failed, splitting batch and retrying: {summarize_exception(batch_error)}",
+                details={
+                    "batch_size": len(batch_entries),
+                    "first_source_transaction_id": str(batch_entries[0].get("source_id") or ""),
+                    "last_source_transaction_id": str(batch_entries[-1].get("source_id") or ""),
+                },
+            )
+
+        midpoint = max(1, len(batch_entries) // 2)
+        self._submit_transaction_batch_entries(
+            batch_entries=batch_entries[:midpoint],
+            checkpoint=checkpoint,
+            report=report,
+            existing_import_map=existing_import_map,
+        )
+        self._submit_transaction_batch_entries(
+            batch_entries=batch_entries[midpoint:],
+            checkpoint=checkpoint,
+            report=report,
+            existing_import_map=existing_import_map,
+        )
+
+    def _submit_single_transaction_entry(
+        self,
+        entry: Dict[str, Any],
+        checkpoint: CheckpointStore,
+        report: Dict[str, Any],
+        existing_import_map: Dict[str, str],
+    ) -> None:
+        source_id = str(entry.get("source_id") or "")
+        import_id = str(entry.get("import_id") or "")
+        payload = entry.get("payload")
+        source_tx = entry.get("tx") if isinstance(entry.get("tx"), dict) else {}
+        if not source_id or not import_id or not isinstance(payload, dict):
+            return
+
+        try:
+            response_data = self.dest_client.create_transactions(self.dest_plan_id, payload)
+            self._apply_transaction_batch_response(
+                checkpoint=checkpoint,
+                response_data=response_data,
+                source_by_import={import_id: source_id},
+                existing_import_map=existing_import_map,
+                report=report,
+            )
+        except Exception as single_error:  # noqa: BLE001
+            self._record_issue(
+                report,
+                "errors",
+                "transaction",
+                source_id,
+                f"single transaction failed: {summarize_exception(single_error)}",
+                details=self._transaction_issue_details(source_tx),
+            )
 
     def _process_starting_balance_transaction(
         self,
@@ -2211,7 +2535,15 @@ class MigrationEngine:
         for payee in destination_payees:
             if payee.get("transfer_account_id"):
                 continue
-            by_name.setdefault(normalize_name(payee.get("name")), []).append(payee)
+            destination_id = payee.get("id")
+            destination_name = payee.get("name")
+            if not destination_id or not isinstance(destination_name, str):
+                continue
+            by_name.setdefault(destination_name, []).append(payee)
+
+        used_destination_payee_ids: Set[str] = {
+            str(dest_id) for dest_id in merged.values() if dest_id
+        }
 
         for source_payee in source_payees:
             source_id = source_payee.get("id")
@@ -2219,9 +2551,16 @@ class MigrationEngine:
                 continue
             if source_payee.get("transfer_account_id"):
                 continue
-            matches = by_name.get(normalize_name(source_payee.get("name")), [])
+            source_name = source_payee.get("name")
+            if not isinstance(source_name, str):
+                continue
+            matches = by_name.get(source_name, [])
             if len(matches) == 1:
-                merged[source_id] = matches[0]["id"]
+                matched_dest_id = str(matches[0].get("id"))
+                if matched_dest_id in used_destination_payee_ids:
+                    continue
+                merged[source_id] = matched_dest_id
+                used_destination_payee_ids.add(matched_dest_id)
         return merged
 
     def _create_scheduled_transactions(
