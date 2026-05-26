@@ -13,7 +13,12 @@ except Exception:  # noqa: BLE001
     curses = None
 
 from .client import RetryConfig, YNABClient
-from .migration import MigrationEngine, get_apply_entity_prompt_options, resolve_apply_entities
+from .migration import (
+    APPLY_PROFILE_DEFAULT,
+    MigrationEngine,
+    get_apply_entity_prompt_options,
+    resolve_apply_entities,
+)
 from .runtime_logging import build_runtime_logger, command_log_path
 
 
@@ -130,14 +135,15 @@ def _run_apply_selector_curses(options: List[Dict[str, Any]]) -> Optional[int]:
             stdscr.addstr(1, 0, "The chosen option will auto-include required dependencies.")
             row = 3
             for idx, option in enumerate(options):
-                detail = "all entities"
+                detail = ""
                 dependencies = option.get("dependencies") or []
-                if option.get("value") != "everything":
-                    if dependencies:
-                        detail = "includes: " + ", ".join(str(dep) for dep in dependencies)
-                    else:
-                        detail = "no dependencies"
-                line = f"{option.get('label')} ({detail})"
+                if option.get("value") == "everything":
+                    detail = "all entities"
+                elif dependencies:
+                    detail = "includes: " + ", ".join(str(dep) for dep in dependencies)
+                line = str(option.get("label"))
+                if detail:
+                    line = f"{line} ({detail})"
                 if idx == selected_index:
                     stdscr.addstr(row, 0, f"> {line}", curses.A_REVERSE)
                 else:
@@ -161,40 +167,68 @@ def _run_apply_selector_curses(options: List[Dict[str, Any]]) -> Optional[int]:
     return curses.wrapper(_selector)
 
 
-def _choose_apply_entities(logger: logging.Logger, as_json: bool) -> List[str]:
+def _choose_apply_scope(logger: logging.Logger, as_json: bool) -> Dict[str, Any]:
     if as_json:
         logger.info("Interactive apply scope prompt skipped in --json mode; defaulting to Everything.")
-        return ["everything"]
+        return {
+            "selection": "auto",
+            "selected_entities": None,
+            "apply_profile": None,
+        }
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         logger.info("Interactive apply scope prompt skipped (non-interactive terminal); defaulting to Everything.")
-        return ["everything"]
+        return {
+            "selection": "auto",
+            "selected_entities": None,
+            "apply_profile": None,
+        }
     if curses is None:
         logger.info("Interactive apply scope prompt unavailable on this platform; defaulting to Everything.")
-        return ["everything"]
+        return {
+            "selection": "auto",
+            "selected_entities": None,
+            "apply_profile": None,
+        }
 
     prompt_options = get_apply_entity_prompt_options()
-    label_by_entity = {
-        option.get("entity"): option.get("label")
+    label_by_value = {
+        str(option.get("value")): str(option.get("label", option.get("value")))
         for option in prompt_options
+        if option.get("value")
     }
     options: List[Dict[str, Any]] = [
         {
             "value": "everything",
             "label": "Everything",
             "dependencies": [],
+            "apply_profile": APPLY_PROFILE_DEFAULT,
+            "selected_entities": ["everything"],
         }
     ]
     for option in prompt_options:
-        entity = str(option.get("entity"))
+        value = str(option.get("value", "")).strip()
+        if not value:
+            continue
+        label = str(option.get("label", value))
+        selected_entities_raw = option.get("selected_entities")
+        selected_entities = (
+            [str(item) for item in selected_entities_raw]
+            if isinstance(selected_entities_raw, list) and selected_entities_raw
+            else [value]
+        )
+        apply_profile = str(option.get("apply_profile", APPLY_PROFILE_DEFAULT))
+        dependencies_raw = option.get("dependencies")
         dependency_labels = [
-            str(label_by_entity.get(dep, dep))
-            for dep in option.get("dependencies", [])
+            str(label_by_value.get(str(dep), dep))
+            for dep in (dependencies_raw if isinstance(dependencies_raw, list) else [])
         ]
         options.append(
             {
-                "value": entity,
-                "label": str(option.get("label", entity)),
+                "value": value,
+                "label": label,
                 "dependencies": dependency_labels,
+                "apply_profile": apply_profile,
+                "selected_entities": selected_entities,
             }
         )
 
@@ -202,20 +236,35 @@ def _choose_apply_entities(logger: logging.Logger, as_json: bool) -> List[str]:
     if selected_index is None:
         raise RuntimeError("apply cancelled by user before execution")
 
-    selection = str(options[selected_index]["value"])
-    effective_entities = resolve_apply_entities([selection])
+    selected_option = options[selected_index]
+    selection = str(selected_option["value"])
+    apply_profile = str(selected_option.get("apply_profile", APPLY_PROFILE_DEFAULT))
+    selected_entities_raw = selected_option.get("selected_entities", ["everything"])
+    if isinstance(selected_entities_raw, list):
+        selected_entities = [str(item) for item in selected_entities_raw]
+    else:
+        selected_entities = [str(selected_entities_raw)]
+    if apply_profile == APPLY_PROFILE_DEFAULT:
+        effective_entities = resolve_apply_entities(selected_entities)
+    else:
+        effective_entities = selected_entities
     print(
         "apply scope: "
-        + str(options[selected_index]["label"])
+        + str(selected_option["label"])
         + " -> "
         + ", ".join(effective_entities)
     )
     logger.info(
-        "Apply scope selected: %s (effective entities: %s)",
+        "Apply scope selected: %s (profile: %s, effective entities: %s)",
         selection,
+        apply_profile,
         ",".join(effective_entities),
     )
-    return [selection]
+    return {
+        "selection": selection,
+        "selected_entities": selected_entities,
+        "apply_profile": apply_profile,
+    }
 
 
 def _emit(report: Dict[str, Any], as_json: bool) -> None:
@@ -246,6 +295,9 @@ def _emit(report: Dict[str, Any], as_json: bool) -> None:
     elif mode == "apply":
         mapping_counts = report.get("mapping_counts", {})
         apply_entities = report.get("apply_entities", [])
+        apply_profile = report.get("apply_profile")
+        if apply_profile:
+            print(f"apply profile: {apply_profile}")
         if isinstance(apply_entities, list) and apply_entities:
             print(f"apply entities: {', '.join(str(item) for item in apply_entities)}")
         print(f"mapped transactions: {mapping_counts.get('transactions', 0)}")
@@ -276,8 +328,11 @@ def main(argv: Any = None) -> int:
         if args.command == "plan":
             report = engine.plan()
         elif args.command == "apply":
-            selected_entities = _choose_apply_entities(logger=logger.getChild("cli"), as_json=bool(args.json))
-            report = engine.apply(selected_entities=selected_entities)
+            scope = _choose_apply_scope(logger=logger.getChild("cli"), as_json=bool(args.json))
+            report = engine.apply(
+                selected_entities=scope.get("selected_entities"),
+                apply_profile=scope.get("apply_profile"),
+            )
         elif args.command == "verify":
             report = engine.verify()
         elif args.command == "resume":

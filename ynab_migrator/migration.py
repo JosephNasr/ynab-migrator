@@ -48,10 +48,20 @@ APPLY_ENTITY_EXECUTION_ORDER: Tuple[str, ...] = (
     "scheduled_transactions",
     "month_budgets",
 )
+APPLY_PROFILE_DEFAULT = "default"
+APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY = "categories_structure_only"
+APPLY_PROFILE_VALUES: Set[str] = {
+    APPLY_PROFILE_DEFAULT,
+    APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY,
+}
+STRUCTURE_ONLY_APPLY_ENTITIES: Tuple[str, ...] = (
+    "category_groups",
+    "categories",
+)
 APPLY_ENTITY_LABELS: Dict[str, str] = {
     "accounts": "Accounts",
     "category_groups": "Category Groups",
-    "categories": "Categories",
+    "categories": "Categories with Targets",
     "payees": "Payees",
     "transactions": "Transactions",
     "scheduled_transactions": "Scheduled Transactions",
@@ -128,12 +138,48 @@ def get_apply_entity_prompt_options() -> List[Dict[str, Any]]:
         ]
         options.append(
             {
-                "entity": entity,
+                "value": entity,
                 "label": APPLY_ENTITY_LABELS.get(entity, entity),
                 "dependencies": dependencies,
+                "apply_profile": APPLY_PROFILE_DEFAULT,
+                "selected_entities": [entity],
             }
         )
+
+    structure_only_option = {
+        "value": APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY,
+        "label": "Category Structure Only",
+        "dependencies": ["category_groups"],
+        "apply_profile": APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY,
+        "selected_entities": list(STRUCTURE_ONLY_APPLY_ENTITIES),
+    }
+    categories_index = next(
+        (
+            index
+            for index, option in enumerate(options)
+            if str(option.get("value")) == "categories"
+        ),
+        None,
+    )
+    if categories_index is None:
+        options.append(structure_only_option)
+    else:
+        options.insert(categories_index, structure_only_option)
     return options
+
+
+def normalize_apply_profile(value: Optional[Any]) -> str:
+    if value is None:
+        return APPLY_PROFILE_DEFAULT
+    token = str(value).strip().lower()
+    if not token:
+        return APPLY_PROFILE_DEFAULT
+    if token not in APPLY_PROFILE_VALUES:
+        supported = ", ".join(sorted(APPLY_PROFILE_VALUES))
+        raise RuntimeError(
+            f"unsupported apply profile '{token}'. Supported values: {supported}"
+        )
+    return token
 
 
 def _today_utc() -> date:
@@ -465,8 +511,16 @@ class MigrationEngine:
         )
         return report
 
-    def apply(self, selected_entities: Optional[Iterable[str]] = None) -> Dict[str, Any]:
-        requested_apply_entities = resolve_apply_entities(selected_entities)
+    def apply(
+        self,
+        selected_entities: Optional[Iterable[str]] = None,
+        apply_profile: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        requested_apply_profile = normalize_apply_profile(apply_profile)
+        if requested_apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY:
+            requested_apply_entities = list(STRUCTURE_ONLY_APPLY_ENTITIES)
+        else:
+            requested_apply_entities = resolve_apply_entities(selected_entities)
         self._log_stage(
             "apply",
             "command",
@@ -474,6 +528,7 @@ class MigrationEngine:
             source_plan_id=self.source_plan_id,
             dest_plan_id=self.dest_plan_id,
             workdir=self.paths.workdir,
+            requested_profile=requested_apply_profile,
             requested_entities=",".join(requested_apply_entities),
         )
         snapshot = self._load_snapshot()
@@ -502,46 +557,102 @@ class MigrationEngine:
                         "checkpoint schema version is incompatible; rerun from a clean workdir"
                     )
 
+            existing_apply_profile_raw = checkpoint.get_metadata("apply_profile")
+            if existing_apply_profile_raw is None:
+                effective_apply_profile = requested_apply_profile
+                checkpoint.set_metadata("apply_profile", effective_apply_profile)
+            else:
+                if not isinstance(existing_apply_profile_raw, str):
+                    raise RuntimeError(
+                        "checkpoint apply_profile metadata is invalid; rerun from a clean workdir"
+                    )
+                existing_apply_profile = normalize_apply_profile(existing_apply_profile_raw)
+                if apply_profile is None:
+                    effective_apply_profile = existing_apply_profile
+                elif requested_apply_profile != existing_apply_profile:
+                    raise RuntimeError(
+                        "requested apply profile conflicts with checkpoint profile; "
+                        "use `resume` to continue checkpoint profile or rerun with a clean workdir"
+                    )
+                else:
+                    effective_apply_profile = existing_apply_profile
+
             existing_apply_entities_raw = checkpoint.get_metadata("apply_entities")
             existing_apply_entities: List[str] = []
             if isinstance(existing_apply_entities_raw, list) and existing_apply_entities_raw:
-                existing_apply_entities = resolve_apply_entities(existing_apply_entities_raw)
+                normalized_existing_entities = []
+                for raw_entity in existing_apply_entities_raw:
+                    entity_token = str(raw_entity).strip().lower()
+                    if not entity_token:
+                        continue
+                    normalized_existing_entities.append(entity_token)
+                unknown_existing_entities = [
+                    entity for entity in normalized_existing_entities if entity not in APPLY_ENTITY_EXECUTION_ORDER
+                ]
+                if unknown_existing_entities:
+                    raise RuntimeError(
+                        "checkpoint apply_entities metadata is invalid; "
+                        "contains unknown entities: " + ",".join(sorted(set(unknown_existing_entities)))
+                    )
+                existing_entity_set = set(normalized_existing_entities)
+                if effective_apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY:
+                    existing_apply_entities = [
+                        entity for entity in STRUCTURE_ONLY_APPLY_ENTITIES if entity in existing_entity_set
+                    ]
+                else:
+                    existing_apply_entities = [
+                        entity for entity in APPLY_ENTITY_EXECUTION_ORDER if entity in existing_entity_set
+                    ]
             elif existing_apply_entities_raw not in (None, [], ()):
                 raise RuntimeError("checkpoint apply_entities metadata is invalid; rerun from a clean workdir")
 
-            if existing_apply_entities:
-                if selected_entities is None:
+            if effective_apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY:
+                structure_only_entities = list(STRUCTURE_ONLY_APPLY_ENTITIES)
+                if existing_apply_entities:
+                    if existing_apply_entities != structure_only_entities:
+                        raise RuntimeError(
+                            "checkpoint apply_entities are incompatible with categories_structure_only profile; "
+                            "rerun with a clean workdir"
+                        )
                     effective_apply_entities = existing_apply_entities
                 else:
-                    requested_set = set(requested_apply_entities)
-                    existing_set = set(existing_apply_entities)
-                    if requested_set == existing_set:
-                        effective_apply_entities = existing_apply_entities
-                    elif requested_set.issuperset(existing_set):
-                        effective_apply_entities = [
-                            entity
-                            for entity in APPLY_ENTITY_EXECUTION_ORDER
-                            if entity in requested_set
-                        ]
-                        checkpoint.set_metadata("apply_entities", effective_apply_entities)
-                        checkpoint.add_event(
-                            "INFO",
-                            "expanded apply_entities scope to " + ",".join(effective_apply_entities),
-                        )
-                    else:
-                        raise RuntimeError(
-                            "requested apply entity scope conflicts with checkpoint scope; "
-                            "use `resume` to continue checkpoint scope or rerun with a clean workdir"
-                        )
+                    effective_apply_entities = structure_only_entities
+                    checkpoint.set_metadata("apply_entities", effective_apply_entities)
             else:
-                effective_apply_entities = requested_apply_entities
-                checkpoint.set_metadata("apply_entities", effective_apply_entities)
+                if existing_apply_entities:
+                    if selected_entities is None:
+                        effective_apply_entities = existing_apply_entities
+                    else:
+                        requested_set = set(requested_apply_entities)
+                        existing_set = set(existing_apply_entities)
+                        if requested_set == existing_set:
+                            effective_apply_entities = existing_apply_entities
+                        elif requested_set.issuperset(existing_set):
+                            effective_apply_entities = [
+                                entity
+                                for entity in APPLY_ENTITY_EXECUTION_ORDER
+                                if entity in requested_set
+                            ]
+                            checkpoint.set_metadata("apply_entities", effective_apply_entities)
+                            checkpoint.add_event(
+                                "INFO",
+                                "expanded apply_entities scope to " + ",".join(effective_apply_entities),
+                            )
+                        else:
+                            raise RuntimeError(
+                                "requested apply entity scope conflicts with checkpoint scope; "
+                                "use `resume` to continue checkpoint scope or rerun with a clean workdir"
+                            )
+                else:
+                    effective_apply_entities = requested_apply_entities
+                    checkpoint.set_metadata("apply_entities", effective_apply_entities)
 
             effective_apply_entity_set = set(effective_apply_entities)
             self._log_stage(
                 "apply",
                 "entity_scope",
                 "complete",
+                profile=effective_apply_profile,
                 entities=",".join(effective_apply_entities),
             )
 
@@ -556,6 +667,7 @@ class MigrationEngine:
                 "dest_plan_id": self.dest_plan_id,
                 "warnings": [],
                 "errors": [],
+                "apply_profile": effective_apply_profile,
                 "apply_entities": effective_apply_entities,
                 "exclusions": checkpoint.get_metadata("exclusions", []),
                 "non_migratable_fields": non_migratable_fields,
@@ -603,6 +715,9 @@ class MigrationEngine:
                     "ambiguous_category_group_name_matches": 0,
                     "reused_categories_by_name_group": 0,
                     "ambiguous_category_name_group_matches": 0,
+                    "skipped_system_category_group_creates_structure_only": 0,
+                    "skipped_system_category_creates_structure_only": 0,
+                    "skipped_goal_note_field_writes_structure_only": 0,
                     "reused_payees_by_exact_name": 0,
                     "ambiguous_payee_exact_name_matches": 0,
                 },
@@ -642,9 +757,13 @@ class MigrationEngine:
             source_system_category_ids.update(
                 source_system_entities["source_credit_card_payment_category_ids"]
             )
+            structure_only_profile = (
+                effective_apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY
+            )
 
             needs_system_group_mapping = bool(
-                effective_apply_entity_set.intersection(
+                not structure_only_profile
+                and effective_apply_entity_set.intersection(
                     {
                         "category_groups",
                         "categories",
@@ -655,7 +774,8 @@ class MigrationEngine:
                 )
             )
             needs_system_category_mapping = bool(
-                effective_apply_entity_set.intersection(
+                not structure_only_profile
+                and effective_apply_entity_set.intersection(
                     {
                         "categories",
                         "transactions",
@@ -706,6 +826,7 @@ class MigrationEngine:
                     checkpoint=checkpoint,
                     report=report,
                     source_system_group_ids=source_system_group_ids,
+                    structure_only=structure_only_profile,
                 )
                 self._log_stage("apply", "category_groups", "complete")
 
@@ -716,6 +837,8 @@ class MigrationEngine:
                     checkpoint=checkpoint,
                     report=report,
                     source_system_category_ids=source_system_category_ids,
+                    source_system_group_ids=source_system_group_ids,
+                    structure_only=structure_only_profile,
                 )
                 self._log_stage("apply", "categories", "complete")
 
@@ -812,6 +935,9 @@ class MigrationEngine:
             source = snapshot["entities"]
             source_system_entities = snapshot["system_entities"]
             non_migratable_fields = snapshot.get("non_migratable_fields", {})
+            apply_profile = normalize_apply_profile(
+                checkpoint.get_metadata("apply_profile", APPLY_PROFILE_DEFAULT)
+            )
             exclusions = checkpoint.get_metadata("exclusions", [])
             exclusion_set = {(entry["entity"], entry["source_id"]) for entry in exclusions}
             source_internal_category_ids = set(source_system_entities["source_internal_inflow_category_ids"])
@@ -824,6 +950,7 @@ class MigrationEngine:
                 "generated_at": now_utc_iso(),
                 "source_plan_id": self.source_plan_id,
                 "dest_plan_id": self.dest_plan_id,
+                "apply_profile": apply_profile,
                 "mismatches": [],
                 "warnings": [],
                 "exclusions": exclusions,
@@ -950,20 +1077,30 @@ class MigrationEngine:
                 if dest_category is None:
                     self._record_mismatch(report, "category", source_id, "missing destination category")
                     continue
-                expected = {
-                    "name": source_category.get("name"),
-                    "note": source_category.get("note"),
-                    "goal_target": source_category.get("goal_target"),
-                    "goal_target_date": source_category.get("goal_target_date"),
-                    "category_group_id": group_map.get(source_category.get("category_group_id")),
-                }
-                actual = {
-                    "name": dest_category.get("name"),
-                    "note": dest_category.get("note"),
-                    "goal_target": dest_category.get("goal_target"),
-                    "goal_target_date": dest_category.get("goal_target_date"),
-                    "category_group_id": dest_category.get("category_group_id"),
-                }
+                if apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY:
+                    expected = {
+                        "name": source_category.get("name"),
+                        "category_group_id": group_map.get(source_category.get("category_group_id")),
+                    }
+                    actual = {
+                        "name": dest_category.get("name"),
+                        "category_group_id": dest_category.get("category_group_id"),
+                    }
+                else:
+                    expected = {
+                        "name": source_category.get("name"),
+                        "note": source_category.get("note"),
+                        "goal_target": source_category.get("goal_target"),
+                        "goal_target_date": source_category.get("goal_target_date"),
+                        "category_group_id": group_map.get(source_category.get("category_group_id")),
+                    }
+                    actual = {
+                        "name": dest_category.get("name"),
+                        "note": dest_category.get("note"),
+                        "goal_target": dest_category.get("goal_target"),
+                        "goal_target_date": dest_category.get("goal_target_date"),
+                        "category_group_id": dest_category.get("category_group_id"),
+                    }
                 if expected != actual:
                     self._record_mismatch(report, "category", source_id, "field mismatch", expected, actual)
             self._log_stage("verify", "categories_parity", "complete")
@@ -1052,54 +1189,62 @@ class MigrationEngine:
             self._log_stage("verify", "scheduled_transactions_parity", "complete")
 
             # Month budget parity (migrated subset parity)
-            self._log_stage("verify", "month_budget_parity", "start")
-            month_cache: Dict[str, Dict[str, Any]] = {}
-            total_month_budget_entries = len(source["month_category_budgets"])
-            for idx, entry in enumerate(source["month_category_budgets"], start=1):
-                self._log_progress("verify", "month_budget_parity", idx, total_month_budget_entries)
-                source_category_id = entry["category_id"]
-                if source_category_id in source_internal_category_ids:
-                    continue
-                if ("month_budget", f"{entry['month']}:{source_category_id}") in exclusion_set:
-                    continue
-                dest_category_id = category_map.get(source_category_id)
-                if not dest_category_id:
-                    self._record_mismatch(
-                        report,
-                        "month_budget",
-                        f"{entry['month']}:{source_category_id}",
-                        "missing category mapping",
-                    )
-                    continue
+            if apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY:
+                self._log_stage(
+                    "verify",
+                    "month_budget_parity",
+                    "skipped",
+                    reason="apply_profile categories_structure_only does not migrate month budgets",
+                )
+            else:
+                self._log_stage("verify", "month_budget_parity", "start")
+                month_cache: Dict[str, Dict[str, Any]] = {}
+                total_month_budget_entries = len(source["month_category_budgets"])
+                for idx, entry in enumerate(source["month_category_budgets"], start=1):
+                    self._log_progress("verify", "month_budget_parity", idx, total_month_budget_entries)
+                    source_category_id = entry["category_id"]
+                    if source_category_id in source_internal_category_ids:
+                        continue
+                    if ("month_budget", f"{entry['month']}:{source_category_id}") in exclusion_set:
+                        continue
+                    dest_category_id = category_map.get(source_category_id)
+                    if not dest_category_id:
+                        self._record_mismatch(
+                            report,
+                            "month_budget",
+                            f"{entry['month']}:{source_category_id}",
+                            "missing category mapping",
+                        )
+                        continue
 
-                month = entry["month"]
-                if month not in month_cache:
-                    month_cache[month] = self.dest_client.get_plan_month(self.dest_plan_id, month).get(
-                        "month", {}
-                    )
-                categories = month_cache[month].get("categories", [])
-                categories_map = {c["id"]: c for c in clean_deleted(categories)}
-                dest_month_category = categories_map.get(dest_category_id)
-                if not dest_month_category:
-                    self._record_mismatch(
-                        report,
-                        "month_budget",
-                        f"{entry['month']}:{source_category_id}",
-                        "missing destination month category",
-                    )
-                    continue
-                expected_budgeted = _safe_int(entry["budgeted"])
-                actual_budgeted = _safe_int(dest_month_category.get("budgeted"))
-                if expected_budgeted != actual_budgeted:
-                    self._record_mismatch(
-                        report,
-                        "month_budget",
-                        f"{entry['month']}:{source_category_id}",
-                        "budgeted mismatch",
-                        {"budgeted": expected_budgeted},
-                        {"budgeted": actual_budgeted},
-                    )
-            self._log_stage("verify", "month_budget_parity", "complete")
+                    month = entry["month"]
+                    if month not in month_cache:
+                        month_cache[month] = self.dest_client.get_plan_month(self.dest_plan_id, month).get(
+                            "month", {}
+                        )
+                    categories = month_cache[month].get("categories", [])
+                    categories_map = {c["id"]: c for c in clean_deleted(categories)}
+                    dest_month_category = categories_map.get(dest_category_id)
+                    if not dest_month_category:
+                        self._record_mismatch(
+                            report,
+                            "month_budget",
+                            f"{entry['month']}:{source_category_id}",
+                            "missing destination month category",
+                        )
+                        continue
+                    expected_budgeted = _safe_int(entry["budgeted"])
+                    actual_budgeted = _safe_int(dest_month_category.get("budgeted"))
+                    if expected_budgeted != actual_budgeted:
+                        self._record_mismatch(
+                            report,
+                            "month_budget",
+                            f"{entry['month']}:{source_category_id}",
+                            "budgeted mismatch",
+                            {"budgeted": expected_budgeted},
+                            {"budgeted": actual_budgeted},
+                        )
+                self._log_stage("verify", "month_budget_parity", "complete")
 
             report["passed"] = len(report["mismatches"]) == 0
             report["mismatch_count"] = len(report["mismatches"])
@@ -1714,6 +1859,7 @@ class MigrationEngine:
         checkpoint: CheckpointStore,
         report: Dict[str, Any],
         source_system_group_ids: Set[str],
+        structure_only: bool = False,
     ) -> None:
         cursor_name = "category_groups_idx"
         cursor = checkpoint.get_cursor(cursor_name)
@@ -1741,6 +1887,14 @@ class MigrationEngine:
                 continue
             source_id = group.get("id")
             if not source_id:
+                checkpoint.set_cursor(cursor_name, idx + 1)
+                continue
+            if structure_only and source_id in source_system_group_ids:
+                self._increment_system_counter(report, "skipped_system_category_group_creates")
+                self._increment_system_counter(
+                    report,
+                    "skipped_system_category_group_creates_structure_only",
+                )
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
             if checkpoint.get_mapping("category_group", source_id):
@@ -1874,6 +2028,8 @@ class MigrationEngine:
         checkpoint: CheckpointStore,
         report: Dict[str, Any],
         source_system_category_ids: Set[str],
+        source_system_group_ids: Set[str],
+        structure_only: bool = False,
     ) -> None:
         cursor_name = "categories_idx"
         cursor = checkpoint.get_cursor(cursor_name)
@@ -1928,13 +2084,36 @@ class MigrationEngine:
             if not source_id:
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
+            if structure_only and source_id in source_system_category_ids:
+                self._increment_system_counter(report, "skipped_system_category_creates")
+                self._increment_system_counter(
+                    report,
+                    "skipped_system_category_creates_structure_only",
+                )
+                checkpoint.set_cursor(cursor_name, idx + 1)
+                continue
             if checkpoint.get_mapping("category", source_id):
                 if source_id in source_system_category_ids:
                     self._increment_system_counter(report, "skipped_system_category_creates")
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
 
+            if structure_only and (
+                category.get("note")
+                or category.get("goal_target") is not None
+                or category.get("goal_target_date")
+            ):
+                self._increment_system_counter(report, "skipped_goal_note_field_writes_structure_only")
+
             source_group_id = category.get("category_group_id")
+            if structure_only and source_group_id in source_system_group_ids:
+                self._increment_system_counter(report, "skipped_system_category_creates")
+                self._increment_system_counter(
+                    report,
+                    "skipped_system_category_creates_structure_only",
+                )
+                checkpoint.set_cursor(cursor_name, idx + 1)
+                continue
             dest_group_id = checkpoint.get_mapping("category_group", source_group_id) if source_group_id else None
             if not dest_group_id:
                 self._record_issue(
@@ -2004,13 +2183,14 @@ class MigrationEngine:
 
             payload = {
                 "name": category.get("name"),
-                "note": category.get("note"),
                 "category_group_id": dest_group_id,
             }
-            if category.get("goal_target") is not None:
-                payload["goal_target"] = _safe_int(category.get("goal_target"))
-            if category.get("goal_target_date"):
-                payload["goal_target_date"] = category.get("goal_target_date")
+            if not structure_only:
+                payload["note"] = category.get("note")
+                if category.get("goal_target") is not None:
+                    payload["goal_target"] = _safe_int(category.get("goal_target"))
+                if category.get("goal_target_date"):
+                    payload["goal_target_date"] = category.get("goal_target_date")
             try:
                 created = self.dest_client.create_category(self.dest_plan_id, payload).get("category", {})
                 dest_id = created.get("id")
