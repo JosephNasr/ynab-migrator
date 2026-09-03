@@ -2,6 +2,9 @@
 .ynab_migrator/
 .ynab_migrator*/
 
+# Local CLI configuration (contains API tokens)
+ynab-migrator.toml
+
 # Python
 __pycache__/
 *.py[cod]

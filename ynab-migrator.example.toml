@@ -1,0 +1,6 @@
+# Copy this file to ynab-migrator.toml and replace the placeholder values.
+# The real ynab-migrator.toml is ignored by Git because it contains API tokens.
+# Restrict it after copying: chmod 600 ynab-migrator.toml
+
+source_token = "replace-with-source-api-token"
+dest_token = "replace-with-destination-api-token"

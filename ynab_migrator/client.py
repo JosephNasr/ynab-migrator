@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import random
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Deque, Dict, Optional
 
+import fcntl
 import requests
 
 
@@ -25,36 +29,78 @@ class RetryConfig:
 
 
 class RollingRateLimiter:
-    def __init__(self, requests_per_hour: int = 200, logger: Optional[logging.Logger] = None):
+    def __init__(
+        self,
+        requests_per_hour: int = 200,
+        logger: Optional[logging.Logger] = None,
+        state_path: Optional[Path] = None,
+    ):
         self.requests_per_hour = requests_per_hour
         self._timestamps: Deque[float] = deque()
         self.logger = logger
+        self.state_path = state_path
+
+    def _load_state(self) -> None:
+        if self.state_path is None or not self.state_path.exists():
+            return
+        try:
+            values = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if isinstance(values, list):
+                self._timestamps = deque(float(item) for item in values)
+        except (OSError, ValueError, TypeError):
+            self._timestamps = deque()
+
+    def _save_state(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_name(f"{self.state_path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(list(self._timestamps)), encoding="utf-8")
+        temporary.replace(self.state_path)
 
     def acquire(self) -> float:
         slept_seconds = 0.0
         while True:
-            now = time.time()
-            one_hour_ago = now - 3600
-            while self._timestamps and self._timestamps[0] < one_hour_ago:
-                self._timestamps.popleft()
+            lock_handle = None
+            try:
+                if self.state_path is not None:
+                    lock_path = self.state_path.with_name(self.state_path.name + ".lock")
+                    lock_path.parent.mkdir(parents=True, exist_ok=True)
+                    lock_handle = lock_path.open("a+", encoding="utf-8")
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                    self._load_state()
+                now = time.time()
+                one_hour_ago = now - 3600
+                while self._timestamps and self._timestamps[0] < one_hour_ago:
+                    self._timestamps.popleft()
 
-            if len(self._timestamps) < self.requests_per_hour:
-                self._timestamps.append(now)
-                return slept_seconds
+                if len(self._timestamps) < self.requests_per_hour:
+                    self._timestamps.append(now)
+                    self._save_state()
+                    return slept_seconds
 
-            sleep_for = max(1.0, self._timestamps[0] + 3600 - now)
-            slept_seconds += sleep_for
+                sleep_for = max(1.0, self._timestamps[0] + 3600 - now)
+            finally:
+                if lock_handle is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                    lock_handle.close()
+            sleep_chunk = min(sleep_for, 60.0)
+            slept_seconds += sleep_chunk
             if self.logger:
                 if self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(
                         "rate_limit_wait sleep_seconds=%.2f queued=%s limit_per_hour=%s",
-                        sleep_for,
+                        sleep_chunk,
                         len(self._timestamps),
                         self.requests_per_hour,
                     )
                 else:
-                    self.logger.info("Rate limit reached. Waiting %.2fs before continuing.", sleep_for)
-            time.sleep(sleep_for)
+                    self.logger.info(
+                        "Rate limit reached. Waiting %.2fs (%.2fs until capacity is expected).",
+                        sleep_chunk,
+                        sleep_for,
+                    )
+            time.sleep(sleep_chunk)
 
 
 class YNABClient:
@@ -66,16 +112,21 @@ class YNABClient:
         rate_limit_per_hour: int = 200,
         retry_config: Optional[RetryConfig] = None,
         logger: Optional[logging.Logger] = None,
+        rate_limiter: Optional[RollingRateLimiter] = None,
+        rate_limiter_state_path: Optional[Path] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.retry_config = retry_config or RetryConfig()
         self.logger = logger or logging.getLogger("ynab_migrator.client")
-        self.rate_limiter = RollingRateLimiter(
+        self.rate_limiter = rate_limiter or RollingRateLimiter(
             requests_per_hour=rate_limit_per_hour,
             logger=self.logger.getChild("rate_limiter"),
+            state_path=rate_limiter_state_path,
         )
         self.session = requests.Session()
+        self._request_counts: Dict[str, int] = {}
+        self._rate_limit_wait_seconds = 0.0
         self.session.headers.update(
             {
                 "Authorization": f"Bearer {token}",
@@ -97,6 +148,9 @@ class YNABClient:
         attempt = 0
         while True:
             rate_limit_sleep = self.rate_limiter.acquire()
+            self._rate_limit_wait_seconds += rate_limit_sleep
+            metric_key = f"{method.upper()} {path}"
+            self._request_counts[metric_key] = self._request_counts.get(metric_key, 0) + 1
             request_started_at = time.perf_counter()
             payload_summary = self._payload_summary(json_body)
             params_keys = sorted(params.keys()) if isinstance(params, dict) else []
@@ -196,6 +250,13 @@ class YNABClient:
                 return data
             return {}
 
+    def metrics(self) -> Dict[str, Any]:
+        return {
+            "request_attempts": sum(self._request_counts.values()),
+            "requests_by_endpoint": dict(sorted(self._request_counts.items())),
+            "rate_limit_wait_seconds": round(self._rate_limit_wait_seconds, 2),
+        }
+
     def _sleep_for_retry(self, attempt: int, response: Optional[requests.Response]) -> float:
         if response is not None:
             retry_after = response.headers.get("Retry-After")
@@ -261,29 +322,86 @@ class YNABClient:
         return ";".join(summary_parts)
 
     # Read endpoints
-    def get_plan(self, plan_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/plans/{plan_id}")
+    def get_plans(self) -> Dict[str, Any]:
+        return self._request("GET", "/plans")
+
+    @staticmethod
+    def _delta_params(last_knowledge_of_server: Optional[int]) -> Optional[Dict[str, Any]]:
+        if last_knowledge_of_server is None:
+            return None
+        return {"last_knowledge_of_server": int(last_knowledge_of_server)}
+
+    def get_plan(
+        self,
+        plan_id: str,
+        last_knowledge_of_server: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/plans/{plan_id}",
+            params=self._delta_params(last_knowledge_of_server),
+        )
 
     def get_plan_settings(self, plan_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/plans/{plan_id}/settings")
 
-    def get_plan_months(self, plan_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/plans/{plan_id}/months")
+    def get_plan_months(
+        self,
+        plan_id: str,
+        last_knowledge_of_server: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/plans/{plan_id}/months",
+            params=self._delta_params(last_knowledge_of_server),
+        )
 
     def get_plan_month(self, plan_id: str, month: str) -> Dict[str, Any]:
         return self._request("GET", f"/plans/{plan_id}/months/{month}")
 
-    def get_accounts(self, plan_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/plans/{plan_id}/accounts")
+    def get_accounts(
+        self,
+        plan_id: str,
+        last_knowledge_of_server: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/plans/{plan_id}/accounts",
+            params=self._delta_params(last_knowledge_of_server),
+        )
 
-    def get_categories(self, plan_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/plans/{plan_id}/categories")
+    def get_categories(
+        self,
+        plan_id: str,
+        last_knowledge_of_server: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/plans/{plan_id}/categories",
+            params=self._delta_params(last_knowledge_of_server),
+        )
 
-    def get_payees(self, plan_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/plans/{plan_id}/payees")
+    def get_payees(
+        self,
+        plan_id: str,
+        last_knowledge_of_server: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/plans/{plan_id}/payees",
+            params=self._delta_params(last_knowledge_of_server),
+        )
 
-    def get_transactions(self, plan_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/plans/{plan_id}/transactions")
+    def get_transactions(
+        self,
+        plan_id: str,
+        last_knowledge_of_server: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/plans/{plan_id}/transactions",
+            params=self._delta_params(last_knowledge_of_server),
+        )
 
     def get_transaction(self, plan_id: str, transaction_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/plans/{plan_id}/transactions/{transaction_id}")
@@ -291,8 +409,16 @@ class YNABClient:
     def get_account_transactions(self, plan_id: str, account_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/plans/{plan_id}/accounts/{account_id}/transactions")
 
-    def get_scheduled_transactions(self, plan_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/plans/{plan_id}/scheduled_transactions")
+    def get_scheduled_transactions(
+        self,
+        plan_id: str,
+        last_knowledge_of_server: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/plans/{plan_id}/scheduled_transactions",
+            params=self._delta_params(last_knowledge_of_server),
+        )
 
     # Write endpoints
     def create_account(self, plan_id: str, account: Dict[str, Any]) -> Dict[str, Any]:
@@ -320,6 +446,13 @@ class YNABClient:
             "PUT",
             f"/plans/{plan_id}/transactions/{transaction_id}",
             json_body={"transaction": transaction},
+        )
+
+    def update_transactions(self, plan_id: str, transactions: Any) -> Dict[str, Any]:
+        return self._request(
+            "PATCH",
+            f"/plans/{plan_id}/transactions",
+            json_body={"transactions": list(transactions)},
         )
 
     def create_scheduled_transaction(

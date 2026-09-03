@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import math
+import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from .checkpoint import CheckpointStore
 from .client import YNABApiError, YNABClient
+from .locking import WorkdirLock
 from .utils import (
     atomic_write_json,
     canonical_json,
@@ -28,6 +31,7 @@ SNAPSHOT_FILE = "snapshot.json"
 PLAN_REPORT_FILE = "plan_report.json"
 APPLY_REPORT_FILE = "apply_report.json"
 VERIFY_REPORT_FILE = "verify_report.json"
+DOCTOR_REPORT_FILE = "doctor_report.json"
 CHECKPOINT_FILE = "checkpoint.sqlite3"
 SNAPSHOT_SCHEMA_VERSION = 3
 
@@ -75,6 +79,19 @@ APPLY_ENTITY_DEPENDENCIES: Dict[str, Set[str]] = {
     "transactions": {"accounts", "categories", "payees"},
     "scheduled_transactions": {"accounts", "categories", "payees"},
     "month_budgets": {"categories"},
+}
+
+PLAN_COLLECTION_KEYS: Dict[str, str] = {
+    "accounts": "id",
+    "payees": "id",
+    "payee_locations": "id",
+    "category_groups": "id",
+    "categories": "id",
+    "months": "month",
+    "transactions": "id",
+    "subtransactions": "id",
+    "scheduled_transactions": "id",
+    "scheduled_subtransactions": "id",
 }
 
 
@@ -229,6 +246,7 @@ class MigrationPaths:
     plan_report_path: Path
     apply_report_path: Path
     verify_report_path: Path
+    doctor_report_path: Path
 
     @classmethod
     def from_workdir(cls, workdir: Path) -> "MigrationPaths":
@@ -239,6 +257,7 @@ class MigrationPaths:
             plan_report_path=workdir / PLAN_REPORT_FILE,
             apply_report_path=workdir / APPLY_REPORT_FILE,
             verify_report_path=workdir / VERIFY_REPORT_FILE,
+            doctor_report_path=workdir / DOCTOR_REPORT_FILE,
         )
 
 
@@ -253,6 +272,10 @@ class MigrationEngine:
         tx_batch_size: int = 50,
         logger: Optional[logging.Logger] = None,
     ):
+        if str(source_plan_id).strip() == str(dest_plan_id).strip():
+            raise ValueError(
+                "source and destination plan IDs must be different; refusing to mutate the source plan"
+            )
         self.source_client = source_client
         self.dest_client = dest_client
         self.source_plan_id = source_plan_id
@@ -260,7 +283,100 @@ class MigrationEngine:
         self.tx_batch_size = max(1, tx_batch_size)
         self.paths = MigrationPaths.from_workdir(workdir)
         self.logger = logger or logging.getLogger("ynab_migrator.migration")
+        self._destination_plan_cache: Optional[Dict[str, Any]] = None
+        self._destination_server_knowledge: Optional[int] = None
+        self._destination_state_dirty = False
+        self._pending_transaction_imports: Dict[str, str] = {}
+        self._pending_transfer_pairs: List[Dict[str, Any]] = []
         ensure_dir(self.paths.workdir)
+
+    def _reset_destination_state(self) -> None:
+        self._destination_plan_cache = None
+        self._destination_server_knowledge = None
+        self._destination_state_dirty = False
+        self._pending_transaction_imports = {}
+        self._pending_transfer_pairs = []
+
+    @staticmethod
+    def _merge_plan_delta(
+        current: Dict[str, Any],
+        delta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        merged = dict(current)
+        for field, value in delta.items():
+            key_field = PLAN_COLLECTION_KEYS.get(field)
+            if key_field is None:
+                merged[field] = value
+                continue
+            if value is None:
+                continue
+            if not isinstance(value, list):
+                continue
+
+            existing_items = merged.get(field, [])
+            indexed: Dict[str, Dict[str, Any]] = {}
+            without_key: List[Dict[str, Any]] = []
+            for item in existing_items if isinstance(existing_items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                item_key = item.get(key_field)
+                if item_key is None:
+                    without_key.append(item)
+                else:
+                    indexed[str(item_key)] = item
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                item_key = item.get(key_field)
+                if item_key is None:
+                    without_key.append(item)
+                else:
+                    indexed[str(item_key)] = item
+            merged[field] = list(indexed.values()) + without_key
+        return merged
+
+    def _load_destination_state(self, refresh: bool = False) -> Dict[str, Any]:
+        if self._destination_plan_cache is None:
+            payload = self.dest_client.get_plan(self.dest_plan_id)
+            self._destination_plan_cache = dict(payload.get("plan", {}))
+        elif refresh:
+            if self._destination_server_knowledge is None:
+                payload = self.dest_client.get_plan(self.dest_plan_id)
+                self._destination_plan_cache = dict(payload.get("plan", {}))
+            else:
+                payload = self.dest_client.get_plan(
+                    self.dest_plan_id,
+                    last_knowledge_of_server=self._destination_server_knowledge,
+                )
+                self._destination_plan_cache = self._merge_plan_delta(
+                    self._destination_plan_cache,
+                    dict(payload.get("plan", {})),
+                )
+        else:
+            return self._destination_plan_cache
+
+        server_knowledge = payload.get("server_knowledge")
+        if server_knowledge is not None:
+            self._destination_server_knowledge = _safe_int(server_knowledge)
+        self._destination_state_dirty = False
+        return self._destination_plan_cache
+
+    def _cached_destination_entities(self, collection: str) -> Optional[List[Dict[str, Any]]]:
+        if self._destination_plan_cache is None:
+            return None
+        values = self._destination_plan_cache.get(collection, [])
+        if not isinstance(values, list):
+            return []
+        return [item for item in values if isinstance(item, dict)]
+
+    def _cache_destination_entity(self, collection: str, entity: Dict[str, Any]) -> None:
+        if self._destination_plan_cache is None or not isinstance(entity, dict):
+            return
+        self._destination_plan_cache = self._merge_plan_delta(
+            self._destination_plan_cache,
+            {collection: [entity]},
+        )
+        self._destination_state_dirty = True
 
     def _log_stage(self, mode: str, stage: str, event: str, **fields: Any) -> None:
         pretty_mode = mode.strip().upper()
@@ -315,14 +431,11 @@ class MigrationEngine:
         source_plan = source_payload.get("plan", {})
         self._log_stage("plan", "fetch_source_plan", "complete")
 
-        self._log_stage("plan", "fetch_source_settings", "start")
-        source_settings = self.source_client.get_plan_settings(self.source_plan_id).get("settings", {})
-        self._log_stage("plan", "fetch_source_settings", "complete")
-
-        self._log_stage("plan", "fetch_source_months", "start")
-        months_payload = self.source_client.get_plan_months(self.source_plan_id)
-        month_summaries = clean_deleted(months_payload.get("months", []))
-        self._log_stage("plan", "fetch_source_months", "complete", months=len(month_summaries))
+        source_settings = {
+            "date_format": source_plan.get("date_format"),
+            "currency_format": source_plan.get("currency_format"),
+        }
+        source_months = clean_deleted(source_plan.get("months", []))
 
         # Enforce tombstone filtering at extraction time.
         self._log_stage("plan", "extract_entities", "start")
@@ -332,7 +445,7 @@ class MigrationEngine:
         payees = clean_deleted(source_plan.get("payees", []))
         transactions = self._extract_transactions(source_plan)
         scheduled_transactions = self._extract_scheduled_transactions(source_plan, report)
-        month_category_budgets, month_notes = self._extract_month_budgets(month_summaries)
+        month_category_budgets, month_notes = self._extract_month_budgets(source_months)
         system_entities = self._build_source_system_entities(category_groups, categories, report)
         non_migratable_fields = self._extract_non_migratable_fields(
             source_accounts=accounts,
@@ -413,7 +526,7 @@ class MigrationEngine:
                 "payees": payees,
                 "transactions": transactions,
                 "scheduled_transactions": scheduled_transactions,
-                "months": month_summaries,
+                "months": source_months,
                 "month_category_budgets": month_category_budgets,
             },
             "integrity": {
@@ -453,7 +566,7 @@ class MigrationEngine:
                 "payees": len(payees),
                 "transactions": len(transactions),
                 "scheduled_transactions": len(scheduled_transactions),
-                "months": len(month_summaries),
+                "months": len(source_months),
                 "month_category_budgets": len(month_category_budgets),
             },
             "system_entities": {
@@ -516,6 +629,18 @@ class MigrationEngine:
         selected_entities: Optional[Iterable[str]] = None,
         apply_profile: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Apply under an engine-level lock so non-CLI callers are also protected."""
+        with WorkdirLock(self.paths.workdir / "apply.lock", "apply"):
+            return self._apply_unlocked(
+                selected_entities=selected_entities,
+                apply_profile=apply_profile,
+            )
+
+    def _apply_unlocked(
+        self,
+        selected_entities: Optional[Iterable[str]] = None,
+        apply_profile: Optional[str] = None,
+    ) -> Dict[str, Any]:
         requested_apply_profile = normalize_apply_profile(apply_profile)
         if requested_apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY:
             requested_apply_entities = list(STRUCTURE_ONLY_APPLY_ENTITIES)
@@ -532,7 +657,9 @@ class MigrationEngine:
             requested_entities=",".join(requested_apply_entities),
         )
         snapshot = self._load_snapshot()
+        self._backup_checkpoint_before_upgrade()
         checkpoint = CheckpointStore(self.paths.checkpoint_path)
+        report: Optional[Dict[str, Any]] = None
         try:
             if checkpoint.get_metadata("source_plan_id") is None:
                 checkpoint.set_metadata("source_plan_id", self.source_plan_id)
@@ -660,7 +787,7 @@ class MigrationEngine:
             non_migratable_fields = snapshot.get("non_migratable_fields", {})
             account_note_count = len(non_migratable_fields.get("account_notes", []))
             month_note_count = len(non_migratable_fields.get("month_notes", []))
-            report: Dict[str, Any] = {
+            report = {
                 "mode": "apply",
                 "generated_at": now_utc_iso(),
                 "source_plan_id": self.source_plan_id,
@@ -732,6 +859,7 @@ class MigrationEngine:
                     report,
                     f"{month_note_count} month notes are read-only in YNAB API and were recorded as non-migratable."
                 )
+            atomic_write_json(self.paths.apply_report_path, report)
 
             source_entities = snapshot["entities"]
             source_accounts = source_entities["accounts"]
@@ -741,6 +869,43 @@ class MigrationEngine:
             source_transactions = source_entities["transactions"]
             source_scheduled_transactions = source_entities["scheduled_transactions"]
             month_category_budgets = source_entities["month_category_budgets"]
+
+            exclusions = checkpoint.get_metadata("exclusions", [])
+            excluded_by_entity: Dict[str, Set[str]] = {}
+            for exclusion in exclusions if isinstance(exclusions, list) else []:
+                if not isinstance(exclusion, dict):
+                    continue
+                excluded_by_entity.setdefault(str(exclusion.get("entity") or ""), set()).add(
+                    str(exclusion.get("source_id") or "")
+                )
+            if "transactions" in effective_apply_entity_set:
+                checkpoint.seed_entity_statuses(
+                    "transaction",
+                    (str(item["id"]) for item in source_transactions if item.get("id")),
+                    excluded_ids=excluded_by_entity.get("transaction", set()),
+                )
+            if "scheduled_transactions" in effective_apply_entity_set:
+                checkpoint.seed_entity_statuses(
+                    "scheduled_transaction",
+                    (str(item["id"]) for item in source_scheduled_transactions if item.get("id")),
+                    excluded_ids=excluded_by_entity.get("scheduled_transaction", set()),
+                )
+            if "month_budgets" in effective_apply_entity_set:
+                checkpoint.seed_entity_statuses(
+                    "month_budget",
+                    (
+                        f"{item.get('month')}:{item.get('category_id')}"
+                        for item in month_category_budgets
+                        if item.get("month") and item.get("category_id")
+                    ),
+                    excluded_ids=excluded_by_entity.get("month_budget", set()),
+                )
+            recovered_operations = checkpoint.recover_interrupted_operations()
+            if recovered_operations:
+                checkpoint.add_event(
+                    "WARNING",
+                    f"marked {recovered_operations} interrupted API operation(s) for reconciliation",
+                )
 
             source_accounts_by_id = {account["id"]: account for account in source_accounts}
             source_payees_by_id = {payee["id"]: payee for payee in source_payees}
@@ -760,6 +925,11 @@ class MigrationEngine:
             structure_only_profile = (
                 effective_apply_profile == APPLY_PROFILE_CATEGORIES_STRUCTURE_ONLY
             )
+
+            self._reset_destination_state()
+            self._log_stage("apply", "fetch_destination_working_set", "start")
+            self._load_destination_state()
+            self._log_stage("apply", "fetch_destination_working_set", "complete")
 
             needs_system_group_mapping = bool(
                 not structure_only_profile
@@ -799,6 +969,13 @@ class MigrationEngine:
                 self._log_stage("apply", "accounts", "start", total=len(source_accounts))
                 self._create_accounts(source_accounts, checkpoint, report)
                 self._log_stage("apply", "accounts", "complete")
+
+            if self._destination_state_dirty and (
+                needs_system_category_mapping or "transactions" in effective_apply_entity_set
+            ):
+                self._log_stage("apply", "refresh_destination_after_accounts", "start")
+                self._load_destination_state(refresh=True)
+                self._log_stage("apply", "refresh_destination_after_accounts", "complete")
 
             if needs_system_category_mapping:
                 self._log_stage("apply", "resolve_system_entities_post_accounts", "start")
@@ -859,6 +1036,10 @@ class MigrationEngine:
                 self._log_stage("apply", "transactions", "complete")
 
             if "scheduled_transactions" in effective_apply_entity_set:
+                if self._destination_state_dirty:
+                    self._log_stage("apply", "refresh_destination_payees", "start")
+                    self._load_destination_state(refresh=True)
+                    self._log_stage("apply", "refresh_destination_payees", "complete")
                 self._log_stage("apply", "payees_refresh", "start", total=len(source_payees))
                 self._seed_payee_name_mappings(source_payees, checkpoint, report)
                 self._log_stage("apply", "payees_refresh", "complete")
@@ -878,6 +1059,10 @@ class MigrationEngine:
                 self._log_stage("apply", "scheduled_transactions", "complete")
 
             if "month_budgets" in effective_apply_entity_set:
+                if self._destination_state_dirty:
+                    self._log_stage("apply", "refresh_destination_months", "start")
+                    self._load_destination_state(refresh=True)
+                    self._log_stage("apply", "refresh_destination_months", "complete")
                 self._log_stage(
                     "apply",
                     "month_budgets",
@@ -900,9 +1085,27 @@ class MigrationEngine:
                 "transactions": len(checkpoint.list_mappings("transaction")),
                 "scheduled_transactions": len(checkpoint.list_mappings("scheduled_transaction")),
             }
+            report["work_status_counts"] = {
+                entity: checkpoint.entity_status_counts(entity)
+                for entity in ("transaction", "scheduled_transaction", "month_budget")
+            }
+            pending_transfer_patches = checkpoint.get_metadata("pending_transfer_cleared_patches", {})
+            report["pending_transfer_cleared_patch_count"] = (
+                len(pending_transfer_patches) if isinstance(pending_transfer_patches, dict) else 0
+            )
+            unresolved_statuses = {"pending", "in_progress", "retryable_failed", "ambiguous_commit", "permanently_failed"}
+            report["complete"] = not any(
+                status in unresolved_statuses and count > 0
+                for counts in report["work_status_counts"].values()
+                for status, count in counts.items()
+            ) and not report.get("errors") and report["pending_transfer_cleared_patch_count"] == 0
             report["checkpoint"] = str(self.paths.checkpoint_path)
             report["exclusions"] = checkpoint.get_metadata("exclusions", [])
             report["events"] = checkpoint.list_events(limit=500)
+            report["api_metrics"] = {
+                "source": self.source_client.metrics() if hasattr(self.source_client, "metrics") else {},
+                "destination": self.dest_client.metrics() if hasattr(self.dest_client, "metrics") else {},
+            }
 
             atomic_write_json(self.paths.apply_report_path, report)
             self._log_stage(
@@ -915,10 +1118,123 @@ class MigrationEngine:
             )
             return report
         finally:
+            if report is not None and "complete" not in report:
+                report["complete"] = False
+                report["interrupted_or_failed"] = True
+                report["checkpoint"] = str(self.paths.checkpoint_path)
+                report["work_status_counts"] = {
+                    entity: checkpoint.entity_status_counts(entity)
+                    for entity in ("transaction", "scheduled_transaction", "month_budget")
+                }
+                try:
+                    atomic_write_json(self.paths.apply_report_path, report)
+                except Exception:  # noqa: BLE001
+                    pass
             checkpoint.close()
 
     def resume(self) -> Dict[str, Any]:
         return self.apply()
+
+    def _backup_checkpoint_before_upgrade(self) -> None:
+        if not self.paths.checkpoint_path.exists():
+            return
+        backup_path = self.paths.workdir / "checkpoint.pre-v2.sqlite3"
+        if backup_path.exists():
+            return
+        source = sqlite3.connect(str(self.paths.checkpoint_path))
+        destination = sqlite3.connect(str(backup_path))
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+
+    def doctor(self) -> Dict[str, Any]:
+        snapshot = self._load_snapshot()
+        self._backup_checkpoint_before_upgrade()
+        checkpoint = CheckpointStore(self.paths.checkpoint_path)
+        try:
+            entities = snapshot["entities"]
+            destination_transactions = clean_deleted(
+                self.dest_client.get_transactions(self.dest_plan_id).get("transactions", [])
+            )
+            destination_ids = {
+                str(item.get("id")) for item in destination_transactions if item.get("id")
+            }
+            destination_imports = {
+                str(item.get("import_id")): str(item.get("id"))
+                for item in destination_transactions
+                if item.get("import_id") and item.get("id")
+            }
+            transaction_mappings = checkpoint.get_mapping_dict("transaction")
+            recoverable = []
+            for tx in entities["transactions"]:
+                source_id = tx.get("id")
+                if not source_id or source_id in transaction_mappings or tx.get("transfer_transaction_id"):
+                    continue
+                import_id = deterministic_import_id(self.source_plan_id, str(source_id))
+                if import_id in destination_imports:
+                    recoverable.append(
+                        {"source_id": str(source_id), "dest_id": destination_imports[import_id], "import_id": import_id}
+                    )
+            stale = [
+                {"source_id": source_id, "dest_id": dest_id}
+                for source_id, dest_id in transaction_mappings.items()
+                if dest_id not in destination_ids
+            ]
+            destination_to_sources: Dict[str, List[str]] = {}
+            for source_id, dest_id in transaction_mappings.items():
+                destination_to_sources.setdefault(dest_id, []).append(source_id)
+            collisions = [
+                {"dest_id": dest_id, "source_ids": sorted(source_ids)}
+                for dest_id, source_ids in destination_to_sources.items()
+                if len(source_ids) > 1
+            ]
+            ambiguous_transaction_ids = {
+                item["source_id"]
+                for item in checkpoint.list_entity_statuses("transaction")
+                if item["status"] == "ambiguous_commit"
+            }
+            transfer_source_ids = {
+                str(tx.get("id"))
+                for tx in entities["transactions"]
+                if tx.get("id") and tx.get("transfer_transaction_id")
+            }
+            ambiguous_transfer_ids = sorted(ambiguous_transaction_ids.intersection(transfer_source_ids))
+            ambiguous_scheduled_ids = sorted(
+                item["source_id"]
+                for item in checkpoint.list_entity_statuses("scheduled_transaction")
+                if item["status"] == "ambiguous_commit"
+            )
+            report = {
+                "mode": "doctor",
+                "generated_at": now_utc_iso(),
+                "checkpoint": str(self.paths.checkpoint_path),
+                "cursors": checkpoint.list_cursors(),
+                "mapping_counts": {
+                    entity: len(checkpoint.list_mappings(entity))
+                    for entity in ("account", "category_group", "category", "payee", "transaction", "scheduled_transaction")
+                },
+                "work_status_counts": {
+                    entity: checkpoint.entity_status_counts(entity)
+                    for entity in ("transaction", "scheduled_transaction", "month_budget")
+                },
+                "source_counts": {
+                    "transactions": len(entities["transactions"]),
+                    "scheduled_transactions": len(entities["scheduled_transactions"]),
+                    "month_budgets": len(entities["month_category_budgets"]),
+                },
+                "recoverable_transaction_mappings": recoverable,
+                "stale_transaction_mappings": stale,
+                "transaction_mapping_collisions": collisions,
+                "ambiguous_transfer_source_ids": ambiguous_transfer_ids,
+                "ambiguous_scheduled_transaction_ids": ambiguous_scheduled_ids,
+                "safe_to_resume": not stale and not collisions and not ambiguous_transfer_ids and not ambiguous_scheduled_ids,
+            }
+            atomic_write_json(self.paths.doctor_report_path, report)
+            return report
+        finally:
+            checkpoint.close()
 
     def verify(self) -> Dict[str, Any]:
         self._log_stage(
@@ -970,7 +1286,14 @@ class MigrationEngine:
                 )
 
             self._log_stage("verify", "fetch_destination_snapshot", "start")
-            dest_plan = self.dest_client.get_plan(self.dest_plan_id).get("plan", {})
+            self._reset_destination_state()
+            destination_payload = self.dest_client.get_plan(self.dest_plan_id)
+            dest_plan = destination_payload.get("plan", {})
+            self._destination_plan_cache = dict(dest_plan)
+            if destination_payload.get("server_knowledge") is not None:
+                self._destination_server_knowledge = _safe_int(
+                    destination_payload.get("server_knowledge")
+                )
             dest_accounts = {a["id"]: a for a in clean_deleted(dest_plan.get("accounts", []))}
             dest_groups = {
                 group["id"]: group
@@ -984,6 +1307,11 @@ class MigrationEngine:
             dest_subtransactions = clean_deleted(dest_plan.get("subtransactions", []))
             dest_scheduled_raw = clean_deleted(dest_plan.get("scheduled_transactions", []))
             dest_scheduled_subs = clean_deleted(dest_plan.get("scheduled_subtransactions", []))
+            dest_months = {
+                str(month["month"]): month
+                for month in clean_deleted(dest_plan.get("months", []))
+                if month.get("month")
+            }
             self._log_stage("verify", "fetch_destination_snapshot", "complete")
 
             subtransactions_by_tx_id: Dict[str, List[Dict[str, Any]]] = {}
@@ -1025,6 +1353,74 @@ class MigrationEngine:
                 source_payees=source["payees"],
                 existing_payee_map=payee_map,
             )
+
+            apply_entities = set(checkpoint.get_metadata("apply_entities", []))
+            coverage: Dict[str, Dict[str, int]] = {}
+
+            def _check_coverage(entity: str, source_ids: Iterable[str], mappings: Dict[str, str]) -> None:
+                expected_ids = {str(item) for item in source_ids}
+                excluded_ids = {
+                    source_id for excluded_entity, source_id in exclusion_set if excluded_entity == entity
+                }
+                missing_ids = sorted(expected_ids - set(mappings) - excluded_ids)
+                coverage[entity] = {
+                    "expected": len(expected_ids),
+                    "mapped": len(expected_ids.intersection(mappings)),
+                    "excluded": len(expected_ids.intersection(excluded_ids)),
+                    "missing": len(missing_ids),
+                }
+                for source_id in missing_ids:
+                    self._record_mismatch(report, entity, source_id, "missing checkpoint mapping")
+
+            if "accounts" in apply_entities:
+                _check_coverage("account", source_accounts_by_id, account_map)
+            if "category_groups" in apply_entities:
+                _check_coverage("category_group", source_groups_by_id, group_map)
+            if "categories" in apply_entities:
+                _check_coverage("category", source_categories_by_id, category_map)
+            if "transactions" in apply_entities:
+                _check_coverage("transaction", source_transactions_by_id, transaction_map)
+                destination_to_sources: Dict[str, List[str]] = {}
+                for source_id, dest_id in transaction_map.items():
+                    destination_to_sources.setdefault(dest_id, []).append(source_id)
+                for dest_id, source_ids in destination_to_sources.items():
+                    if len(source_ids) > 1:
+                        for source_id in source_ids:
+                            self._record_mismatch(
+                                report,
+                                "transaction",
+                                source_id,
+                                "multiple source transactions map to one destination transaction",
+                                {"source_ids": sorted(source_ids)},
+                                {"dest_id": dest_id},
+                            )
+            if "scheduled_transactions" in apply_entities:
+                _check_coverage("scheduled_transaction", source_scheduled_by_id, scheduled_map)
+            if "month_budgets" in apply_entities:
+                month_statuses = {
+                    item["source_id"]: item["status"]
+                    for item in checkpoint.list_entity_statuses("month_budget")
+                }
+                month_source_ids = {
+                    f"{item.get('month')}:{item.get('category_id')}"
+                    for item in source["month_category_budgets"]
+                    if item.get("month") and item.get("category_id")
+                }
+                completed_month_ids = {
+                    source_id
+                    for source_id, status in month_statuses.items()
+                    if status in CheckpointStore.TERMINAL_STATUSES
+                }
+                missing_month_ids = sorted(month_source_ids - completed_month_ids)
+                coverage["month_budget"] = {
+                    "expected": len(month_source_ids),
+                    "mapped": sum(1 for status in month_statuses.values() if status == "succeeded"),
+                    "excluded": sum(1 for status in month_statuses.values() if status == "excluded"),
+                    "missing": len(missing_month_ids),
+                }
+                for source_id in missing_month_ids:
+                    self._record_mismatch(report, "month_budget", source_id, "missing terminal apply outcome")
+            report["coverage"] = coverage
 
             # Accounts
             self._log_stage("verify", "accounts_parity", "start", mapped=len(account_map))
@@ -1219,9 +1615,7 @@ class MigrationEngine:
 
                     month = entry["month"]
                     if month not in month_cache:
-                        month_cache[month] = self.dest_client.get_plan_month(self.dest_plan_id, month).get(
-                            "month", {}
-                        )
+                        month_cache[month] = dest_months.get(month, {})
                     categories = month_cache[month].get("categories", [])
                     categories_map = {c["id"]: c for c in clean_deleted(categories)}
                     dest_month_category = categories_map.get(dest_category_id)
@@ -1314,17 +1708,16 @@ class MigrationEngine:
         return extracted
 
     def _extract_month_budgets(
-        self, month_summaries: List[Dict[str, Any]]
+        self, months: List[Dict[str, Any]]
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         month_budgets: List[Dict[str, Any]] = []
         month_notes: List[Dict[str, Any]] = []
-        ordered_months = sorted(month_summaries, key=lambda item: item.get("month", ""))
-        for idx, month_summary in enumerate(ordered_months, start=1):
+        ordered_months = sorted(months, key=lambda item: item.get("month", ""))
+        for idx, month_detail in enumerate(ordered_months, start=1):
             self._log_progress("plan", "month_budget_extraction", idx, len(ordered_months))
-            month = month_summary.get("month")
+            month = month_detail.get("month")
             if not month:
                 continue
-            month_detail = self.source_client.get_plan_month(self.source_plan_id, month).get("month", {})
             month_note = month_detail.get("note")
             if month_note:
                 month_notes.append({"month": month, "note": month_note})
@@ -1380,8 +1773,14 @@ class MigrationEngine:
     def _estimate_apply_requests(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
         entities = snapshot["entities"]
         system_entities = snapshot["system_entities"]
-        transaction_count = len(entities["transactions"])
-        tx_requests = int(math.ceil(transaction_count / float(self.tx_batch_size)))
+        transfer_ids = {
+            str(tx.get("id"))
+            for tx in entities["transactions"]
+            if tx.get("id") and tx.get("transfer_transaction_id")
+        }
+        transfer_pair_count = int(math.ceil(len(transfer_ids) / 2.0))
+        ordinary_transaction_count = max(0, len(entities["transactions"]) - len(transfer_ids))
+        tx_requests = int(math.ceil(ordinary_transaction_count / float(self.tx_batch_size)))
         system_group_count = len(
             set(system_entities["source_internal_master_category_group_ids"])
             | set(system_entities["source_hidden_category_group_ids"])
@@ -1404,22 +1803,33 @@ class MigrationEngine:
             for tx in entities["transactions"]
             if self._is_starting_balance_transaction(tx, source_payees_by_id)
         )
-        internal_month_budget_count = sum(
+        writable_nonzero_month_budgets = sum(
             1
             for entry in entities["month_category_budgets"]
-            if entry.get("category_id") in internal_category_id_set
+            if entry.get("category_id") not in internal_category_id_set
+            and _safe_int(entry.get("budgeted")) != 0
         )
+        month_count = len({entry.get("month") for entry in entities["month_category_budgets"] if entry.get("month")})
+        has_transactions = bool(ordinary_transaction_count or transfer_pair_count)
         estimate = {
+            "startup_budget_discovery": 0,
+            "read_destination_working_set": 1,
+            "refresh_after_account_creation_max": 1 if entities["accounts"] else 0,
             "create_accounts": len(entities["accounts"]),
             "create_category_groups": max(0, len(entities["category_groups"]) - system_group_count),
             "create_categories": max(0, len(entities["categories"]) - system_category_count),
-            "delete_auto_starting_balance_transactions": starting_balance_tx_count,
+            "delete_auto_starting_balance_transactions_max": starting_balance_tx_count,
             "create_transactions": tx_requests,
+            "create_transfer_pairs": transfer_pair_count,
+            "grouped_transaction_reconciliation_max": 4 if has_transactions else 0,
+            "patch_transfer_cleared_batches": 1 if transfer_pair_count else 0,
             "create_scheduled_transactions": len(entities["scheduled_transactions"]),
-            "patch_month_budgets": max(
-                0, len(entities["month_category_budgets"]) - internal_month_budget_count
+            "refresh_before_scheduled_transactions_max": (
+                1 if entities["scheduled_transactions"] and has_transactions else 0
             ),
-            "overhead_reads": 16,
+            "refresh_before_month_budgets_max": 1 if month_count else 0,
+            "fallback_destination_month_reads_max": 0,
+            "patch_month_budgets_max": writable_nonzero_month_budgets,
         }
         estimate["total_estimated"] = sum(estimate.values())
         estimate["hours_at_200_req_per_hour"] = round(estimate["total_estimated"] / 200.0, 2)
@@ -1602,9 +2012,15 @@ class MigrationEngine:
         report: Dict[str, Any],
     ) -> None:
         cursor_name = "accounts_idx"
-        cursor = checkpoint.get_cursor(cursor_name)
+        cursor = 0
+        checkpoint.set_cursor(cursor_name, 0)
         accounts = sorted(source_accounts, key=lambda item: (item.get("name") or "", item.get("id") or ""))
-        destination_accounts = clean_deleted(self.dest_client.get_accounts(self.dest_plan_id).get("accounts", []))
+        cached_accounts = self._cached_destination_entities("accounts")
+        destination_accounts = clean_deleted(
+            cached_accounts
+            if cached_accounts is not None
+            else self.dest_client.get_accounts(self.dest_plan_id).get("accounts", [])
+        )
         destination_accounts_by_name: Dict[str, List[Dict[str, Any]]] = {}
         for destination_account in destination_accounts:
             destination_id = destination_account.get("id")
@@ -1647,23 +2063,17 @@ class MigrationEngine:
                     matched_account = type_matches[0]
                     matched_dest_id = str(matched_account.get("id"))
                     if matched_dest_id in used_destination_account_ids:
-                        if not coerced:
-                            self._record_issue(
-                                report,
-                                "warnings",
-                                "account",
-                                source_id,
-                                "exact destination account name+type match already mapped to another source account; creating new account",
-                                details={
-                                    "account_name": source_name,
-                                    "source_type": source_type,
-                                    "matched_destination_account_id": matched_dest_id,
-                                },
-                            )
-                            self._increment_system_counter(
-                                report,
-                                "ambiguous_account_name_type_matches",
-                            )
+                        self._increment_system_counter(
+                            report,
+                            "ambiguous_unsupported_account_name_type_matches"
+                            if coerced
+                            else "ambiguous_account_name_type_matches",
+                        )
+                        raise RuntimeError(
+                            "ambiguous destination account reuse for "
+                            f"source account {source_id!r} ({source_name!r}, {source_type!r}): "
+                            f"destination account {matched_dest_id!r} is already mapped to another source account"
+                        )
                     else:
                         checkpoint.set_mapping("account", source_id, matched_dest_id)
                         used_destination_account_ids.add(matched_dest_id)
@@ -1683,26 +2093,22 @@ class MigrationEngine:
                                 "reused_unsupported_accounts_by_name_type",
                             )
                         continue
-                elif len(type_matches) > 1 and not coerced:
-                    self._record_issue(
-                        report,
-                        "warnings",
-                        "account",
-                        source_id,
-                        "multiple destination accounts matched exact name+type; creating new account",
-                        details={
-                            "account_name": source_name,
-                            "source_type": source_type,
-                            "matched_destination_account_ids": [
-                                str(candidate.get("id"))
-                                for candidate in type_matches
-                                if candidate.get("id")
-                            ],
-                        },
-                    )
+                elif len(type_matches) > 1:
                     self._increment_system_counter(
                         report,
-                        "ambiguous_account_name_type_matches",
+                        "ambiguous_unsupported_account_name_type_matches"
+                        if coerced
+                        else "ambiguous_account_name_type_matches",
+                    )
+                    matched_ids = sorted(
+                        str(candidate.get("id"))
+                        for candidate in type_matches
+                        if candidate.get("id")
+                    )
+                    raise RuntimeError(
+                        "ambiguous destination account reuse for "
+                        f"source account {source_id!r} ({source_name!r}, {source_type!r}): "
+                        f"multiple exact matches {matched_ids!r}"
                     )
 
                 if coerced:
@@ -1715,25 +2121,6 @@ class MigrationEngine:
                         "source_type": source_type,
                         "mapped_type": account_type,
                     }
-
-                    if len(type_matches) > 1:
-                        fallback_reason = "multiple destination accounts matched exact name+type"
-                        warning_payload["matched_destination_account_ids"] = [
-                            str(candidate.get("id"))
-                            for candidate in type_matches
-                            if candidate.get("id")
-                        ]
-                        self._increment_system_counter(
-                                report,
-                                "ambiguous_unsupported_account_name_type_matches",
-                            )
-                    elif len(type_matches) == 1:
-                        matched_account = type_matches[0]
-                        matched_dest_id = str(matched_account.get("id"))
-                        fallback_reason = (
-                            "exact name+type destination account already mapped to another source account"
-                        )
-                        warning_payload["matched_destination_account_id"] = matched_dest_id
 
                     warning_payload["decision_reason"] = fallback_reason
                     report.setdefault("warnings", []).append(warning_payload)
@@ -1763,7 +2150,14 @@ class MigrationEngine:
                     if not dest_id:
                         raise RuntimeError("account creation response missing account.id")
                     checkpoint.set_mapping("account", source_id, dest_id)
+                    self._cache_destination_entity("accounts", created)
                     used_destination_account_ids.add(str(dest_id))
+                    newly_created = checkpoint.get_metadata("newly_created_source_account_ids", [])
+                    if not isinstance(newly_created, list):
+                        newly_created = []
+                    if str(source_id) not in newly_created:
+                        newly_created.append(str(source_id))
+                        checkpoint.set_metadata("newly_created_source_account_ids", newly_created)
                     checkpoint.add_event("INFO", f"account mapped {source_id} -> {dest_id}")
 
                     source_transfer_payee = account.get("transfer_payee_id")
@@ -1796,7 +2190,8 @@ class MigrationEngine:
         report: Dict[str, Any],
     ) -> None:
         existing_candidates = checkpoint.get_metadata("auto_starting_balance_candidates")
-        if isinstance(existing_candidates, dict):
+        capture_complete = checkpoint.get_metadata("auto_starting_balance_capture_complete", False)
+        if isinstance(existing_candidates, dict) and capture_complete is True:
             captured_count = sum(
                 len(value)
                 for value in existing_candidates.values()
@@ -1808,26 +2203,46 @@ class MigrationEngine:
             return
 
         account_map = checkpoint.get_mapping_dict("account")
-        destination_payees = clean_deleted(self.dest_client.get_payees(self.dest_plan_id).get("payees", []))
+        newly_created_source_ids = {
+            str(item)
+            for item in checkpoint.get_metadata("newly_created_source_account_ids", [])
+            if item
+        }
+        cached_payees = self._cached_destination_entities("payees")
+        destination_payees = clean_deleted(
+            cached_payees
+            if cached_payees is not None
+            else self.dest_client.get_payees(self.dest_plan_id).get("payees", [])
+        )
         destination_payees_by_id = {
             payee.get("id"): payee
             for payee in destination_payees
             if isinstance(payee, dict) and payee.get("id")
         }
 
+        cached_transactions = self._cached_destination_entities("transactions")
+        all_destination_transactions = clean_deleted(
+            cached_transactions
+            if cached_transactions is not None
+            else self.dest_client.get_transactions(self.dest_plan_id).get("transactions", [])
+        )
+        transactions_by_account: Dict[str, List[Dict[str, Any]]] = {}
+        for transaction in all_destination_transactions:
+            account_id = transaction.get("account_id")
+            if account_id:
+                transactions_by_account.setdefault(str(account_id), []).append(transaction)
+
         candidates_by_source_account: Dict[str, List[str]] = {}
         for account in sorted(source_accounts, key=lambda item: (item.get("name") or "", item.get("id") or "")):
             source_account_id = account.get("id")
             if not source_account_id:
                 continue
+            if str(source_account_id) not in newly_created_source_ids:
+                continue
             destination_account_id = account_map.get(source_account_id)
             if not destination_account_id:
                 continue
-            destination_transactions = clean_deleted(
-                self.dest_client.get_account_transactions(self.dest_plan_id, destination_account_id).get(
-                    "transactions", []
-                )
-            )
+            destination_transactions = transactions_by_account.get(str(destination_account_id), [])
             candidates: List[Tuple[str, str]] = []
             for tx in destination_transactions:
                 if not self._is_auto_starting_balance_candidate(tx, destination_payees_by_id):
@@ -1843,6 +2258,7 @@ class MigrationEngine:
             ]
 
         checkpoint.set_metadata("auto_starting_balance_candidates", candidates_by_source_account)
+        checkpoint.set_metadata("auto_starting_balance_capture_complete", True)
         if checkpoint.get_metadata("starting_balance_tx_candidate_map") is None:
             checkpoint.set_metadata("starting_balance_tx_candidate_map", {})
         if checkpoint.get_metadata("deleted_auto_starting_balance_candidates") is None:
@@ -1862,9 +2278,14 @@ class MigrationEngine:
         structure_only: bool = False,
     ) -> None:
         cursor_name = "category_groups_idx"
-        cursor = checkpoint.get_cursor(cursor_name)
+        cursor = 0
+        checkpoint.set_cursor(cursor_name, 0)
         groups = sorted(source_groups, key=lambda item: (item.get("name") or "", item.get("id") or ""))
-        destination_plan = self.dest_client.get_plan(self.dest_plan_id).get("plan", {})
+        destination_plan = (
+            self._destination_plan_cache
+            if self._destination_plan_cache is not None
+            else self.dest_client.get_plan(self.dest_plan_id).get("plan", {})
+        )
         destination_groups = clean_deleted(destination_plan.get("category_groups", []))
         destination_groups_by_name: Dict[str, List[Dict[str, Any]]] = {}
         for destination_group in destination_groups:
@@ -1909,18 +2330,12 @@ class MigrationEngine:
                 if len(existing_matches) == 1:
                     existing_dest_id = str(existing_matches[0].get("id"))
                     if existing_dest_id in used_destination_group_ids:
-                        self._record_issue(
-                            report,
-                            "warnings",
-                            "category_group",
-                            source_id,
-                            "exact destination category group name match already mapped; creating new category group",
-                            details={
-                                "category_group_name": group_name,
-                                "matched_destination_category_group_id": existing_dest_id,
-                            },
-                        )
                         self._increment_system_counter(report, "ambiguous_category_group_name_matches")
+                        raise RuntimeError(
+                            "ambiguous destination category-group reuse for "
+                            f"source group {source_id!r} ({group_name!r}): destination group "
+                            f"{existing_dest_id!r} is already mapped to another source group"
+                        )
                     else:
                         checkpoint.set_mapping("category_group", source_id, existing_dest_id)
                         used_destination_group_ids.add(existing_dest_id)
@@ -1933,22 +2348,15 @@ class MigrationEngine:
                         checkpoint.set_cursor(cursor_name, idx + 1)
                         continue
                 elif len(existing_matches) > 1:
-                    self._record_issue(
-                        report,
-                        "warnings",
-                        "category_group",
-                        source_id,
-                        "multiple destination category groups matched exact name; creating new category group",
-                        details={
-                            "category_group_name": group_name,
-                            "matched_destination_category_group_ids": [
-                                str(match.get("id"))
-                                for match in existing_matches
-                                if match.get("id")
-                            ],
-                        },
-                    )
                     self._increment_system_counter(report, "ambiguous_category_group_name_matches")
+                    matched_ids = sorted(
+                        str(match.get("id")) for match in existing_matches if match.get("id")
+                    )
+                    raise RuntimeError(
+                        "ambiguous destination category-group reuse for "
+                        f"source group {source_id!r} ({group_name!r}): multiple exact matches "
+                        f"{matched_ids!r}"
+                    )
 
             payload = {"name": group.get("name")}
             try:
@@ -1959,6 +2367,7 @@ class MigrationEngine:
                 if not dest_id:
                     raise RuntimeError("category group response missing id")
                 checkpoint.set_mapping("category_group", source_id, dest_id)
+                self._cache_destination_entity("category_groups", created)
                 used_destination_group_ids.add(str(dest_id))
                 if isinstance(payload.get("name"), str):
                     destination_groups_by_name.setdefault(payload["name"], []).append(created)
@@ -2032,12 +2441,18 @@ class MigrationEngine:
         structure_only: bool = False,
     ) -> None:
         cursor_name = "categories_idx"
-        cursor = checkpoint.get_cursor(cursor_name)
+        cursor = 0
+        checkpoint.set_cursor(cursor_name, 0)
         categories = sorted(
             source_categories,
             key=lambda item: (item.get("category_group_id") or "", item.get("name") or "", item.get("id") or ""),
         )
-        categories_response = self.dest_client.get_categories(self.dest_plan_id)
+        cached_categories = self._cached_destination_entities("categories")
+        categories_response = (
+            {"categories": cached_categories}
+            if cached_categories is not None
+            else self.dest_client.get_categories(self.dest_plan_id)
+        )
         destination_categories = self._extract_destination_categories(categories_response)
         has_flat_shape = isinstance(categories_response.get("categories"), list)
         has_grouped_shape = isinstance(categories_response.get("category_groups"), list)
@@ -2136,20 +2551,12 @@ class MigrationEngine:
                 if len(existing_matches) == 1:
                     existing_dest_id = str(existing_matches[0].get("id"))
                     if existing_dest_id in used_destination_category_ids:
-                        self._record_issue(
-                            report,
-                            "warnings",
-                            "category",
-                            source_id,
-                            "exact destination category name+group match already mapped; creating new category",
-                            details={
-                                "category_name": category_name,
-                                "source_category_group_id": source_group_id,
-                                "dest_category_group_id": dest_group_id,
-                                "matched_destination_category_id": existing_dest_id,
-                            },
-                        )
                         self._increment_system_counter(report, "ambiguous_category_name_group_matches")
+                        raise RuntimeError(
+                            "ambiguous destination category reuse for "
+                            f"source category {source_id!r} ({category_name!r}): destination category "
+                            f"{existing_dest_id!r} is already mapped to another source category"
+                        )
                     else:
                         checkpoint.set_mapping("category", source_id, existing_dest_id)
                         used_destination_category_ids.add(existing_dest_id)
@@ -2162,24 +2569,15 @@ class MigrationEngine:
                         checkpoint.set_cursor(cursor_name, idx + 1)
                         continue
                 elif len(existing_matches) > 1:
-                    self._record_issue(
-                        report,
-                        "warnings",
-                        "category",
-                        source_id,
-                        "multiple destination categories matched exact name+group; creating new category",
-                        details={
-                            "category_name": category_name,
-                            "source_category_group_id": source_group_id,
-                            "dest_category_group_id": dest_group_id,
-                            "matched_destination_category_ids": [
-                                str(match.get("id"))
-                                for match in existing_matches
-                                if match.get("id")
-                            ],
-                        },
-                    )
                     self._increment_system_counter(report, "ambiguous_category_name_group_matches")
+                    matched_ids = sorted(
+                        str(match.get("id")) for match in existing_matches if match.get("id")
+                    )
+                    raise RuntimeError(
+                        "ambiguous destination category reuse for "
+                        f"source category {source_id!r} ({category_name!r}) in destination group "
+                        f"{dest_group_id!r}: multiple exact matches {matched_ids!r}"
+                    )
 
             payload = {
                 "name": category.get("name"),
@@ -2197,6 +2595,7 @@ class MigrationEngine:
                 if not dest_id:
                     raise RuntimeError("category creation response missing id")
                 checkpoint.set_mapping("category", source_id, dest_id)
+                self._cache_destination_entity("categories", created)
                 used_destination_category_ids.add(str(dest_id))
                 if isinstance(payload.get("name"), str):
                     key = (str(dest_group_id), payload["name"])
@@ -2228,7 +2627,12 @@ class MigrationEngine:
         checkpoint: CheckpointStore,
         report: Dict[str, Any],
     ) -> None:
-        destination_payees = clean_deleted(self.dest_client.get_payees(self.dest_plan_id).get("payees", []))
+        cached_payees = self._cached_destination_entities("payees")
+        destination_payees = clean_deleted(
+            cached_payees
+            if cached_payees is not None
+            else self.dest_client.get_payees(self.dest_plan_id).get("payees", [])
+        )
         by_name: Dict[str, List[Dict[str, Any]]] = {}
         for payee in destination_payees:
             if payee.get("transfer_account_id"):
@@ -2306,7 +2710,10 @@ class MigrationEngine:
         report: Dict[str, Any],
     ) -> None:
         cursor_name = "transactions_idx"
-        cursor = checkpoint.get_cursor(cursor_name)
+        # Mappings/statuses are authoritative. Re-scan from the beginning on resume so
+        # legacy cursors cannot hide a committed-but-unmapped transaction.
+        cursor = 0
+        checkpoint.set_cursor(cursor_name, 0)
         transactions = sorted(source_transactions, key=lambda item: (item.get("date") or "", item.get("id") or ""))
         transactions_by_id = {
             str(tx.get("id")): tx for tx in transactions if isinstance(tx, dict) and tx.get("id")
@@ -2344,6 +2751,13 @@ class MigrationEngine:
                     checkpoint.set_cursor(cursor_name, cursor)
                     continue
                 if checkpoint.get_mapping("transaction", source_id):
+                    scan_idx += 1
+                    cursor = scan_idx
+                    checkpoint.set_cursor(cursor_name, cursor)
+                    continue
+
+                work_status = checkpoint.get_entity_status("transaction", str(source_id))
+                if work_status and work_status.get("status") == "excluded":
                     scan_idx += 1
                     cursor = scan_idx
                     checkpoint.set_cursor(cursor_name, cursor)
@@ -2415,6 +2829,12 @@ class MigrationEngine:
                     report=report,
                 )
                 if payload is None:
+                    checkpoint.set_entity_status(
+                        "transaction",
+                        str(source_id),
+                        "retryable_failed",
+                        error=error or "payload build failed",
+                    )
                     self._record_issue(
                         report,
                         "errors",
@@ -2429,6 +2849,13 @@ class MigrationEngine:
                     continue
 
                 payload["import_id"] = import_id
+                checkpoint.set_entity_status(
+                    "transaction",
+                    str(source_id),
+                    "pending",
+                    operation_key=import_id,
+                    payload_hash=stable_hash(payload),
+                )
                 batch_entries.append(
                     {
                         "source_id": source_id,
@@ -2464,6 +2891,18 @@ class MigrationEngine:
             cursor = scan_idx
             checkpoint.set_cursor(cursor_name, cursor)
 
+        self._reconcile_pending_transaction_imports(
+            checkpoint=checkpoint,
+            existing_import_map=existing_import_map,
+            report=report,
+        )
+        self._reconcile_pending_transfer_pairs(
+            checkpoint=checkpoint,
+            report=report,
+            account_map=account_map,
+        )
+        self._flush_transfer_cleared_patches(checkpoint=checkpoint, report=report)
+
     def _submit_transaction_batch_entries(
         self,
         batch_entries: List[Dict[str, Any]],
@@ -2497,6 +2936,14 @@ class MigrationEngine:
             return 0, False
 
         try:
+            for entry in batch_entries:
+                checkpoint.set_entity_status(
+                    "transaction",
+                    str(entry.get("source_id") or ""),
+                    "in_progress",
+                    operation_key=str(entry.get("import_id") or ""),
+                    increment_attempt=True,
+                )
             response_data = self.dest_client.create_transactions(self.dest_plan_id, payloads)
             self._apply_transaction_batch_response(
                 checkpoint=checkpoint,
@@ -2504,10 +2951,34 @@ class MigrationEngine:
                 source_by_import=source_by_import,
                 existing_import_map=existing_import_map,
                 report=report,
+                defer_reconciliation=True,
             )
             return len(payloads), False
         except Exception as batch_error:  # noqa: BLE001
             size_limit_hit = self._is_probable_batch_size_error(batch_error)
+            status_code = int(getattr(batch_error, "status_code", 0) or 0)
+            safe_to_split = isinstance(batch_error, YNABApiError) and status_code in {400, 403, 409, 413}
+            if status_code == 409:
+                mapped_import_ids = self._reconcile_transaction_import_ids(
+                    checkpoint=checkpoint,
+                    source_by_import=source_by_import,
+                    existing_import_map=existing_import_map,
+                    attempts=4,
+                )
+                if mapped_import_ids:
+                    unresolved_entries = [
+                        entry
+                        for entry in batch_entries
+                        if str(entry.get("import_id") or "") not in mapped_import_ids
+                    ]
+                    if not unresolved_entries:
+                        return len(payloads), False
+                    return self._submit_transaction_batch_entries(
+                        batch_entries=unresolved_entries,
+                        checkpoint=checkpoint,
+                        report=report,
+                        existing_import_map=existing_import_map,
+                    )
             self._record_issue(
                 report,
                 "warnings",
@@ -2521,6 +2992,15 @@ class MigrationEngine:
                     "probable_batch_size_limit": size_limit_hit,
                 },
             )
+            for entry in batch_entries:
+                checkpoint.set_entity_status(
+                    "transaction",
+                    str(entry.get("source_id") or ""),
+                    "retryable_failed" if safe_to_split else "ambiguous_commit",
+                    error=summarize_exception(batch_error),
+                )
+            if not safe_to_split:
+                return 0, False
 
         midpoint = max(1, len(batch_entries) // 2)
         left_success, left_size_limit = self._submit_transaction_batch_entries(
@@ -2552,6 +3032,13 @@ class MigrationEngine:
             return False
 
         try:
+            checkpoint.set_entity_status(
+                "transaction",
+                source_id,
+                "in_progress",
+                operation_key=import_id,
+                increment_attempt=True,
+            )
             response_data = self.dest_client.create_transactions(self.dest_plan_id, payload)
             self._apply_transaction_batch_response(
                 checkpoint=checkpoint,
@@ -2559,9 +3046,24 @@ class MigrationEngine:
                 source_by_import={import_id: source_id},
                 existing_import_map=existing_import_map,
                 report=report,
+                defer_reconciliation=True,
             )
-            return True
+            return checkpoint.get_mapping("transaction", source_id) is not None
         except Exception as single_error:  # noqa: BLE001
+            if isinstance(single_error, YNABApiError) and single_error.status_code == 409:
+                mapped = self._reconcile_transaction_import_ids(
+                    checkpoint=checkpoint,
+                    source_by_import={import_id: source_id},
+                    existing_import_map=existing_import_map,
+                )
+                if import_id in mapped:
+                    return True
+            checkpoint.set_entity_status(
+                "transaction",
+                source_id,
+                "ambiguous_commit" if not isinstance(single_error, YNABApiError) else "retryable_failed",
+                error=summarize_exception(single_error),
+            )
             self._record_issue(
                 report,
                 "errors",
@@ -2597,9 +3099,66 @@ class MigrationEngine:
         counterpart_source_id = str(counterpart_tx.get("id") or "")
         if not primary_source_id or not counterpart_source_id:
             return
-        if checkpoint.get_mapping("transaction", primary_source_id) and checkpoint.get_mapping(
-            "transaction", counterpart_source_id
-        ):
+        primary_existing = checkpoint.get_mapping("transaction", primary_source_id)
+        counterpart_existing = checkpoint.get_mapping("transaction", counterpart_source_id)
+        if primary_existing and counterpart_existing:
+            return
+        if primary_existing or counterpart_existing:
+            missing_source_id = counterpart_source_id if primary_existing else primary_source_id
+            known_dest_id = primary_existing or counterpart_existing
+            try:
+                cached_transactions = self._cached_destination_entities("transactions")
+                cached_by_id = {
+                    str(item["id"]): item
+                    for item in cached_transactions or []
+                    if item.get("id")
+                }
+                known = cached_by_id.get(str(known_dest_id), {})
+                if not known and cached_transactions is None:
+                    known = self.dest_client.get_transaction(
+                        self.dest_plan_id, str(known_dest_id)
+                    ).get("transaction", {})
+                linked_id = known.get("transfer_transaction_id")
+                if linked_id and self._validate_destination_transfer_pair(
+                    primary_dest_id=str(primary_existing or linked_id),
+                    counterpart_dest_id=str(linked_id if primary_existing else counterpart_existing),
+                    primary_tx=primary_tx,
+                    counterpart_tx=counterpart_tx,
+                    account_map=account_map,
+                    known_transactions=cached_by_id or {str(known_dest_id): known},
+                    fetch_missing=cached_transactions is None,
+                ):
+                    checkpoint.set_mapping("transaction", missing_source_id, str(linked_id))
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            checkpoint.set_entity_status(
+                "transaction",
+                missing_source_id,
+                "ambiguous_commit",
+                error="one transfer side is mapped but its counterpart could not be resolved",
+            )
+            return
+        primary_status = checkpoint.get_entity_status("transaction", primary_source_id) or {}
+        counterpart_status = checkpoint.get_entity_status("transaction", counterpart_source_id) or {}
+        if "ambiguous_commit" in {primary_status.get("status"), counterpart_status.get("status")}:
+            recovered_pair = self._find_existing_transfer_pair(
+                primary_tx=primary_tx,
+                counterpart_tx=counterpart_tx,
+                account_map=account_map,
+            )
+            if recovered_pair:
+                checkpoint.set_mapping("transaction", primary_source_id, recovered_pair[0])
+                checkpoint.set_mapping("transaction", counterpart_source_id, recovered_pair[1])
+                return
+            self._record_issue(
+                report,
+                "errors",
+                "transaction",
+                primary_source_id,
+                "transfer has an ambiguous prior create; refusing a blind retry",
+                details={"counterpart_source_transaction_id": counterpart_source_id},
+            )
             return
 
         payload, error = self._build_transaction_payload(
@@ -2613,6 +3172,18 @@ class MigrationEngine:
             report=report,
         )
         if payload is None:
+            checkpoint.set_entity_status(
+                "transaction",
+                primary_source_id,
+                "retryable_failed",
+                error=error or "payload build failed",
+            )
+            checkpoint.set_entity_status(
+                "transaction",
+                counterpart_source_id,
+                "retryable_failed",
+                error=error or "payload build failed",
+            )
             self._record_issue(
                 report,
                 "errors",
@@ -2623,10 +3194,28 @@ class MigrationEngine:
             )
             return
         payload.pop("import_id", None)
+        operation_key = "TRANSFER:" + stable_hash(
+            {
+                "source_ids": sorted([primary_source_id, counterpart_source_id]),
+                "payload": payload,
+            }
+        )[:27]
 
         try:
+            for source_id in (primary_source_id, counterpart_source_id):
+                checkpoint.set_entity_status(
+                    "transaction",
+                    source_id,
+                    "in_progress",
+                    operation_key=operation_key,
+                    payload_hash=stable_hash(payload),
+                    increment_attempt=True,
+                )
             response_data = self.dest_client.create_transactions(self.dest_plan_id, payload)
+            self._destination_state_dirty = True
             saved_transactions = self._extract_saved_transactions(response_data)
+            for saved in saved_transactions:
+                self._cache_destination_entity("transactions", saved)
 
             primary_dest_account_id = account_map.get(primary_tx.get("account_id"))
             counterpart_dest_account_id = account_map.get(counterpart_tx.get("account_id"))
@@ -2641,6 +3230,9 @@ class MigrationEngine:
                 saved_id_str = str(saved_id)
                 if primary_dest_account_id and saved_account_id == primary_dest_account_id:
                     primary_dest_id = saved_id_str
+                    linked_id = saved.get("transfer_transaction_id")
+                    if linked_id:
+                        counterpart_dest_id = str(linked_id)
                 if counterpart_dest_account_id and saved_account_id == counterpart_dest_account_id:
                     counterpart_dest_id = saved_id_str
 
@@ -2649,32 +3241,48 @@ class MigrationEngine:
                 if candidate:
                     primary_dest_id = str(candidate)
 
-            if primary_dest_id and counterpart_dest_id is None:
-                try:
-                    fetched = self.dest_client.get_transaction(self.dest_plan_id, primary_dest_id).get(
-                        "transaction", {}
-                    )
-                    linked_dest_id = fetched.get("transfer_transaction_id")
-                    if linked_dest_id:
-                        counterpart_dest_id = str(linked_dest_id)
-                except Exception:  # noqa: BLE001
-                    counterpart_dest_id = None
-
-            if primary_dest_id:
+            known_transactions = {
+                str(saved["id"]): saved
+                for saved in saved_transactions
+                if saved.get("id")
+            }
+            if primary_dest_id and counterpart_dest_id and self._validate_destination_transfer_pair(
+                primary_dest_id=primary_dest_id,
+                counterpart_dest_id=counterpart_dest_id,
+                primary_tx=primary_tx,
+                counterpart_tx=counterpart_tx,
+                account_map=account_map,
+                known_transactions=known_transactions,
+                fetch_missing=self._destination_plan_cache is None,
+            ):
                 checkpoint.set_mapping("transaction", primary_source_id, primary_dest_id)
-            if counterpart_dest_id:
                 checkpoint.set_mapping("transaction", counterpart_source_id, counterpart_dest_id)
+                self._sync_transfer_pair_cleared_status(
+                    primary_source_tx=primary_tx,
+                    counterpart_source_tx=counterpart_tx,
+                    primary_dest_id=primary_dest_id,
+                    counterpart_dest_id=counterpart_dest_id,
+                    report=report,
+                    checkpoint=checkpoint,
+                )
+                return
 
-            if not primary_dest_id or not counterpart_dest_id:
-                missing_source_id = primary_source_id if not primary_dest_id else counterpart_source_id
+            if self._destination_plan_cache is None and primary_dest_id and counterpart_dest_id:
+                for source_id in (primary_source_id, counterpart_source_id):
+                    checkpoint.set_entity_status(
+                        "transaction",
+                        source_id,
+                        "ambiguous_commit",
+                        operation_key=operation_key,
+                        error="destination transfer pair failed reciprocal validation",
+                    )
                 self._record_issue(
                     report,
                     "errors",
                     "transaction",
-                    missing_source_id,
-                    "could not resolve destination transfer transaction ID after create",
+                    primary_source_id,
+                    "created transfer could not be validated as a reciprocal destination pair",
                     details={
-                        "primary_source_transaction_id": primary_source_id,
                         "counterpart_source_transaction_id": counterpart_source_id,
                         "primary_dest_transaction_id": primary_dest_id,
                         "counterpart_dest_transaction_id": counterpart_dest_id,
@@ -2682,14 +3290,25 @@ class MigrationEngine:
                 )
                 return
 
-            self._sync_transfer_pair_cleared_status(
-                primary_source_tx=primary_tx,
-                counterpart_source_tx=counterpart_tx,
-                primary_dest_id=primary_dest_id,
-                counterpart_dest_id=counterpart_dest_id,
-                report=report,
+            self._pending_transfer_pairs.append(
+                {
+                    "primary_tx": primary_tx,
+                    "counterpart_tx": counterpart_tx,
+                    "primary_dest_id": primary_dest_id,
+                    "counterpart_dest_id": counterpart_dest_id,
+                    "operation_key": operation_key,
+                }
             )
         except Exception as error_obj:  # noqa: BLE001
+            for source_id in (primary_source_id, counterpart_source_id):
+                if not checkpoint.get_mapping("transaction", source_id):
+                    checkpoint.set_entity_status(
+                        "transaction",
+                        source_id,
+                        "ambiguous_commit",
+                        operation_key=operation_key,
+                        error=summarize_exception(error_obj),
+                    )
             self._record_issue(
                 report,
                 "errors",
@@ -2699,6 +3318,211 @@ class MigrationEngine:
                 details=self._transaction_issue_details(primary_tx),
             )
 
+    def _find_existing_transfer_pair(
+        self,
+        primary_tx: Dict[str, Any],
+        counterpart_tx: Dict[str, Any],
+        account_map: Dict[str, str],
+    ) -> Optional[Tuple[str, str]]:
+        primary_account_id = account_map.get(primary_tx.get("account_id"))
+        counterpart_account_id = account_map.get(counterpart_tx.get("account_id"))
+        if not primary_account_id or not counterpart_account_id:
+            return None
+        cached_transactions = self._cached_destination_entities("transactions")
+        if cached_transactions is None:
+            candidates = clean_deleted(
+                self.dest_client.get_account_transactions(self.dest_plan_id, primary_account_id).get(
+                    "transactions", []
+                )
+            )
+            known_transactions = {
+                str(item["id"]): item for item in candidates if item.get("id")
+            }
+        else:
+            all_transactions = clean_deleted(cached_transactions)
+            candidates = [
+                item
+                for item in all_transactions
+                if str(item.get("account_id") or "") == str(primary_account_id)
+            ]
+            known_transactions = {
+                str(item["id"]): item for item in all_transactions if item.get("id")
+            }
+        matches: List[Tuple[str, str]] = []
+        for candidate in candidates:
+            linked_id = candidate.get("transfer_transaction_id")
+            if not candidate.get("id") or not linked_id:
+                continue
+            if candidate.get("date") != primary_tx.get("date"):
+                continue
+            if _safe_int(candidate.get("amount")) != _safe_int(primary_tx.get("amount")):
+                continue
+            if (candidate.get("memo") or None) != (primary_tx.get("memo") or None):
+                continue
+            transfer_account_id = candidate.get("transfer_account_id")
+            if transfer_account_id and str(transfer_account_id) != str(counterpart_account_id):
+                continue
+            primary_dest_id = str(candidate["id"])
+            counterpart_dest_id = str(linked_id)
+            if self._validate_destination_transfer_pair(
+                primary_dest_id=primary_dest_id,
+                counterpart_dest_id=counterpart_dest_id,
+                primary_tx=primary_tx,
+                counterpart_tx=counterpart_tx,
+                account_map=account_map,
+                known_transactions=known_transactions,
+                fetch_missing=cached_transactions is None,
+            ):
+                matches.append((primary_dest_id, counterpart_dest_id))
+        return matches[0] if len(matches) == 1 else None
+
+    def _validate_destination_transfer_pair(
+        self,
+        primary_dest_id: str,
+        counterpart_dest_id: str,
+        primary_tx: Dict[str, Any],
+        counterpart_tx: Dict[str, Any],
+        account_map: Dict[str, str],
+        known_transactions: Optional[Dict[str, Dict[str, Any]]] = None,
+        fetch_missing: bool = True,
+    ) -> bool:
+        """Validate both transfer sides before persisting either source mapping."""
+        expected_primary_account = account_map.get(primary_tx.get("account_id"))
+        expected_counterpart_account = account_map.get(counterpart_tx.get("account_id"))
+        if not expected_primary_account or not expected_counterpart_account:
+            return False
+
+        known = known_transactions or {}
+
+        def load(transaction_id: str) -> Dict[str, Any]:
+            transaction = known.get(transaction_id, {})
+            required = {"id", "account_id", "date", "amount", "transfer_transaction_id"}
+            if required.issubset(transaction):
+                return transaction
+            if not fetch_missing:
+                return {}
+            return self.dest_client.get_transaction(self.dest_plan_id, transaction_id).get(
+                "transaction", {}
+            )
+
+        try:
+            primary = load(primary_dest_id)
+            counterpart = load(counterpart_dest_id)
+        except Exception:  # noqa: BLE001
+            return False
+
+        expected = (
+            (
+                primary,
+                primary_dest_id,
+                counterpart_dest_id,
+                expected_primary_account,
+                expected_counterpart_account,
+                primary_tx,
+            ),
+            (
+                counterpart,
+                counterpart_dest_id,
+                primary_dest_id,
+                expected_counterpart_account,
+                expected_primary_account,
+                counterpart_tx,
+            ),
+        )
+        for transaction, own_id, linked_id, account_id, transfer_account_id, source in expected:
+            if str(transaction.get("id") or "") != own_id:
+                return False
+            if str(transaction.get("account_id") or "") != str(account_id):
+                return False
+            if transaction.get("date") != source.get("date"):
+                return False
+            if _safe_int(transaction.get("amount")) != _safe_int(source.get("amount")):
+                return False
+            if str(transaction.get("transfer_transaction_id") or "") != linked_id:
+                return False
+            actual_transfer_account = transaction.get("transfer_account_id")
+            if actual_transfer_account and str(actual_transfer_account) != str(transfer_account_id):
+                return False
+        return True
+
+    def _reconcile_pending_transfer_pairs(
+        self,
+        checkpoint: CheckpointStore,
+        report: Dict[str, Any],
+        account_map: Dict[str, str],
+    ) -> None:
+        if not self._pending_transfer_pairs:
+            return
+        if self._destination_plan_cache is not None and self._destination_state_dirty:
+            self._load_destination_state(refresh=True)
+        cached_transactions = self._cached_destination_entities("transactions") or []
+        known_transactions = {
+            str(item["id"]): item
+            for item in clean_deleted(cached_transactions)
+            if item.get("id")
+        }
+
+        for pending in self._pending_transfer_pairs:
+            primary_tx = pending["primary_tx"]
+            counterpart_tx = pending["counterpart_tx"]
+            primary_source_id = str(primary_tx.get("id") or "")
+            counterpart_source_id = str(counterpart_tx.get("id") or "")
+            primary_dest_id = pending.get("primary_dest_id")
+            counterpart_dest_id = pending.get("counterpart_dest_id")
+
+            resolved_pair: Optional[Tuple[str, str]] = None
+            if primary_dest_id and counterpart_dest_id and self._validate_destination_transfer_pair(
+                primary_dest_id=str(primary_dest_id),
+                counterpart_dest_id=str(counterpart_dest_id),
+                primary_tx=primary_tx,
+                counterpart_tx=counterpart_tx,
+                account_map=account_map,
+                known_transactions=known_transactions,
+                fetch_missing=False,
+            ):
+                resolved_pair = (str(primary_dest_id), str(counterpart_dest_id))
+            if resolved_pair is None:
+                resolved_pair = self._find_existing_transfer_pair(
+                    primary_tx=primary_tx,
+                    counterpart_tx=counterpart_tx,
+                    account_map=account_map,
+                )
+
+            if resolved_pair:
+                checkpoint.set_mapping("transaction", primary_source_id, resolved_pair[0])
+                checkpoint.set_mapping("transaction", counterpart_source_id, resolved_pair[1])
+                self._sync_transfer_pair_cleared_status(
+                    primary_source_tx=primary_tx,
+                    counterpart_source_tx=counterpart_tx,
+                    primary_dest_id=resolved_pair[0],
+                    counterpart_dest_id=resolved_pair[1],
+                    report=report,
+                    checkpoint=checkpoint,
+                )
+                continue
+
+            for source_id in (primary_source_id, counterpart_source_id):
+                checkpoint.set_entity_status(
+                    "transaction",
+                    source_id,
+                    "ambiguous_commit",
+                    operation_key=str(pending.get("operation_key") or ""),
+                    error="destination transfer pair could not be resolved after grouped refresh",
+                )
+            self._record_issue(
+                report,
+                "errors",
+                "transaction",
+                primary_source_id,
+                "created transfer could not be resolved as a reciprocal destination pair",
+                details={
+                    "counterpart_source_transaction_id": counterpart_source_id,
+                    "primary_dest_transaction_id": primary_dest_id,
+                    "counterpart_dest_transaction_id": counterpart_dest_id,
+                },
+            )
+        self._pending_transfer_pairs = []
+
     def _sync_transfer_pair_cleared_status(
         self,
         primary_source_tx: Dict[str, Any],
@@ -2706,6 +3530,7 @@ class MigrationEngine:
         primary_dest_id: str,
         counterpart_dest_id: str,
         report: Dict[str, Any],
+        checkpoint: CheckpointStore,
     ) -> None:
         desired = [
             (primary_dest_id, primary_source_tx.get("cleared"), str(primary_source_tx.get("id") or "")),
@@ -2716,27 +3541,43 @@ class MigrationEngine:
             ),
         ]
         valid_cleared = {"cleared", "uncleared", "reconciled"}
+        pending = checkpoint.get_metadata("pending_transfer_cleared_patches", {})
+        if not isinstance(pending, dict):
+            pending = {}
         for dest_id, cleared_value, source_id in desired:
             if not isinstance(cleared_value, str) or cleared_value not in valid_cleared:
                 continue
-            try:
-                self.dest_client.update_transaction(
-                    self.dest_plan_id,
-                    dest_id,
-                    {"cleared": cleared_value},
-                )
-            except Exception as error_obj:  # noqa: BLE001
-                self._record_issue(
-                    report,
-                    "warnings",
-                    "transaction",
-                    source_id or None,
-                    f"failed to sync transfer cleared status: {summarize_exception(error_obj)}",
-                    details={
-                        "dest_transaction_id": dest_id,
-                        "desired_cleared": cleared_value,
-                    },
-                )
+            pending[dest_id] = {"cleared": cleared_value, "source_id": source_id}
+        checkpoint.set_metadata("pending_transfer_cleared_patches", pending)
+
+    def _flush_transfer_cleared_patches(
+        self,
+        checkpoint: CheckpointStore,
+        report: Dict[str, Any],
+    ) -> None:
+        pending = checkpoint.get_metadata("pending_transfer_cleared_patches", {})
+        if not isinstance(pending, dict) or not pending:
+            return
+        entries = [
+            {"id": dest_id, "cleared": value.get("cleared")}
+            for dest_id, value in pending.items()
+            if isinstance(value, dict) and value.get("cleared") in {"cleared", "uncleared", "reconciled"}
+        ]
+        if not entries:
+            checkpoint.set_metadata("pending_transfer_cleared_patches", {})
+            return
+        try:
+            self.dest_client.update_transactions(self.dest_plan_id, entries)
+            checkpoint.set_metadata("pending_transfer_cleared_patches", {})
+        except Exception as error_obj:  # noqa: BLE001
+            self._record_issue(
+                report,
+                "warnings",
+                "transaction_batch",
+                None,
+                f"failed to bulk-sync transfer cleared statuses: {summarize_exception(error_obj)}",
+                details={"transaction_count": len(entries)},
+            )
 
     def _is_probable_batch_size_error(self, error: Exception) -> bool:
         rendered = summarize_exception(error).lower()
@@ -2792,6 +3633,12 @@ class MigrationEngine:
             report=report,
         )
         if payload is None:
+            checkpoint.set_entity_status(
+                "transaction",
+                str(source_id),
+                "retryable_failed",
+                error=error or "payload build failed",
+            )
             self._record_issue(
                 report,
                 "errors",
@@ -2810,6 +3657,14 @@ class MigrationEngine:
         )
 
         try:
+            checkpoint.set_entity_status(
+                "transaction",
+                str(source_id),
+                "in_progress",
+                operation_key=import_id,
+                payload_hash=stable_hash(payload),
+                increment_attempt=True,
+            )
             response_data = self.dest_client.create_transactions(self.dest_plan_id, payload)
             self._apply_transaction_batch_response(
                 checkpoint=checkpoint,
@@ -2817,8 +3672,24 @@ class MigrationEngine:
                 source_by_import={import_id: source_id},
                 existing_import_map=existing_import_map,
                 report=report,
+                defer_reconciliation=True,
             )
         except Exception as error_obj:  # noqa: BLE001
+            if isinstance(error_obj, YNABApiError) and error_obj.status_code == 409:
+                mapped = self._reconcile_transaction_import_ids(
+                    checkpoint=checkpoint,
+                    source_by_import={import_id: str(source_id)},
+                    existing_import_map=existing_import_map,
+                )
+                if import_id in mapped:
+                    return
+            checkpoint.set_entity_status(
+                "transaction",
+                str(source_id),
+                "ambiguous_commit" if not isinstance(error_obj, YNABApiError) else "retryable_failed",
+                operation_key=import_id,
+                error=summarize_exception(error_obj),
+            )
             self._record_issue(
                 report,
                 "errors",
@@ -2844,17 +3715,6 @@ class MigrationEngine:
             source_account_id=source_account_id,
         )
         if not candidate_id:
-            self._record_issue(
-                report,
-                "warnings",
-                "transaction",
-                source_tx_id,
-                "no captured destination auto Starting Balance transaction found; keeping fallback behavior",
-                details={
-                    "source_account_id": source_account_id,
-                    "starting_balance": True,
-                },
-            )
             self._increment_system_counter(report, "starting_balance_fallback_no_candidate")
             return
 
@@ -2948,6 +3808,7 @@ class MigrationEngine:
         source_by_import: Dict[str, str],
         existing_import_map: Dict[str, str],
         report: Dict[str, Any],
+        defer_reconciliation: bool = False,
     ) -> None:
         created_objects: List[Dict[str, Any]] = []
         if isinstance(response_data.get("transaction"), dict):
@@ -2955,13 +3816,21 @@ class MigrationEngine:
         elif isinstance(response_data.get("transactions"), list):
             created_objects = [item for item in response_data["transactions"] if isinstance(item, dict)]
 
+        returned_ids = {
+            str(item) for item in response_data.get("transaction_ids", []) if item
+        } if isinstance(response_data.get("transaction_ids"), list) else set()
         for created in created_objects:
+            self._cache_destination_entity("transactions", created)
             import_id = created.get("import_id")
             dest_id = created.get("id")
             if import_id and dest_id and import_id in source_by_import:
                 source_id = source_by_import[import_id]
                 checkpoint.set_mapping("transaction", source_id, dest_id)
                 existing_import_map[import_id] = dest_id
+            elif dest_id and str(dest_id) in returned_ids:
+                # Some API responses omit import_id on transaction details. Do not
+                # guess here; the bounded import-map reconciliation below is safer.
+                continue
 
         duplicates = response_data.get("duplicate_import_ids", [])
         if isinstance(duplicates, list):
@@ -2976,31 +3845,124 @@ class MigrationEngine:
             for import_id, source_id in source_by_import.items()
             if checkpoint.get_mapping("transaction", source_id) is None
         ]
-        if unresolved:
-            existing_import_map.update(self._load_destination_transaction_import_map())
+        if defer_reconciliation:
             for import_id in unresolved:
                 source_id = source_by_import.get(import_id)
-                dest_id = existing_import_map.get(import_id)
-                if source_id and dest_id:
-                    checkpoint.set_mapping("transaction", source_id, dest_id)
-                elif source_id:
-                    self._record_issue(
-                        report,
-                        "errors",
-                        "transaction",
-                        source_id,
-                        "could not resolve destination transaction ID after create",
-                        details={"import_id": import_id},
-                    )
+                if source_id:
+                    self._pending_transaction_imports[str(import_id)] = str(source_id)
+            return
+        mapped = self._reconcile_transaction_import_ids(
+            checkpoint=checkpoint,
+            source_by_import={key: source_by_import[key] for key in unresolved},
+            existing_import_map=existing_import_map,
+        ) if unresolved else set()
+        for import_id in unresolved:
+            if import_id in mapped:
+                continue
+            source_id = source_by_import.get(import_id)
+            if source_id:
+                checkpoint.set_entity_status(
+                    "transaction",
+                    source_id,
+                    "ambiguous_commit",
+                    operation_key=import_id,
+                    error="create returned without a safely correlatable destination transaction",
+                )
+                self._record_issue(
+                    report,
+                    "errors",
+                    "transaction",
+                    source_id,
+                    "could not safely correlate destination transaction after create",
+                    details={
+                        "import_id": import_id,
+                        "returned_transaction_ids": sorted(returned_ids),
+                    },
+                )
 
-    def _load_destination_transaction_import_map(self) -> Dict[str, str]:
+    def _reconcile_transaction_import_ids(
+        self,
+        checkpoint: CheckpointStore,
+        source_by_import: Dict[str, str],
+        existing_import_map: Dict[str, str],
+        attempts: int = 4,
+    ) -> Set[str]:
+        remaining = set(source_by_import)
+        mapped: Set[str] = set()
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                time.sleep(min(0.5 * (2 ** (attempt - 1)), 2.0))
+            existing_import_map.update(self._load_destination_transaction_import_map(refresh=True))
+            for import_id in list(remaining):
+                dest_id = existing_import_map.get(import_id)
+                source_id = source_by_import.get(import_id)
+                if not dest_id or not source_id:
+                    continue
+                checkpoint.set_mapping("transaction", source_id, dest_id)
+                mapped.add(import_id)
+                remaining.remove(import_id)
+            if not remaining:
+                break
+        return mapped
+
+    def _reconcile_pending_transaction_imports(
+        self,
+        checkpoint: CheckpointStore,
+        existing_import_map: Dict[str, str],
+        report: Dict[str, Any],
+    ) -> None:
+        if not self._pending_transaction_imports:
+            return
+        pending = dict(self._pending_transaction_imports)
+        mapped = self._reconcile_transaction_import_ids(
+            checkpoint=checkpoint,
+            source_by_import=pending,
+            existing_import_map=existing_import_map,
+        )
+        for import_id, source_id in pending.items():
+            if import_id in mapped or checkpoint.get_mapping("transaction", source_id):
+                continue
+            checkpoint.set_entity_status(
+                "transaction",
+                source_id,
+                "ambiguous_commit",
+                operation_key=import_id,
+                error="create returned without a safely correlatable destination transaction",
+            )
+            self._record_issue(
+                report,
+                "errors",
+                "transaction",
+                source_id,
+                "could not safely correlate destination transaction after grouped reconciliation",
+                details={"import_id": import_id},
+            )
+        self._pending_transaction_imports = {}
+
+    def _load_destination_transaction_import_map(self, refresh: bool = False) -> Dict[str, str]:
         transaction_map: Dict[str, str] = {}
-        destination_transactions = clean_deleted(self.dest_client.get_transactions(self.dest_plan_id).get("transactions", []))
+        ambiguous_import_ids: Set[str] = set()
+        if refresh and self._destination_plan_cache is not None:
+            self._load_destination_state(refresh=True)
+        cached_transactions = self._cached_destination_entities("transactions")
+        destination_transactions = clean_deleted(
+            cached_transactions
+            if cached_transactions is not None
+            else self.dest_client.get_transactions(self.dest_plan_id).get("transactions", [])
+        )
         for transaction in destination_transactions:
             import_id = transaction.get("import_id")
             transaction_id = transaction.get("id")
             if import_id and transaction_id:
-                transaction_map[str(import_id)] = str(transaction_id)
+                import_key = str(import_id)
+                if import_key in ambiguous_import_ids:
+                    continue
+                existing = transaction_map.get(import_key)
+                if existing and existing != str(transaction_id):
+                    transaction_map.pop(import_key, None)
+                    ambiguous_import_ids.add(import_key)
+                    continue
+                transaction_map[import_key] = str(transaction_id)
         return transaction_map
 
     def _augment_payee_map_by_name(
@@ -3009,7 +3971,12 @@ class MigrationEngine:
         existing_payee_map: Dict[str, str],
     ) -> Dict[str, str]:
         merged = dict(existing_payee_map)
-        destination_payees = clean_deleted(self.dest_client.get_payees(self.dest_plan_id).get("payees", []))
+        cached_payees = self._cached_destination_entities("payees")
+        destination_payees = clean_deleted(
+            cached_payees
+            if cached_payees is not None
+            else self.dest_client.get_payees(self.dest_plan_id).get("payees", [])
+        )
         by_name: Dict[str, List[Dict[str, Any]]] = {}
         for payee in destination_payees:
             if payee.get("transfer_account_id"):
@@ -3051,7 +4018,8 @@ class MigrationEngine:
         report: Dict[str, Any],
     ) -> None:
         cursor_name = "scheduled_transactions_idx"
-        cursor = checkpoint.get_cursor(cursor_name)
+        cursor = 0
+        checkpoint.set_cursor(cursor_name, 0)
         scheduled_transactions = sorted(
             source_scheduled_transactions,
             key=lambda item: (item.get("date_next") or item.get("date_first") or "", item.get("id") or ""),
@@ -3075,7 +4043,6 @@ class MigrationEngine:
             if checkpoint.get_mapping("scheduled_transaction", source_id):
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
-
             payload, error = self._build_scheduled_payload(
                 scheduled=scheduled,
                 source_accounts_by_id=source_accounts_by_id,
@@ -3104,7 +4071,28 @@ class MigrationEngine:
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
 
+            status = checkpoint.get_entity_status("scheduled_transaction", str(source_id)) or {}
+            if status.get("status") == "ambiguous_commit":
+                existing_id = self._find_existing_scheduled_transaction(payload)
+                if existing_id:
+                    checkpoint.set_mapping("scheduled_transaction", str(source_id), existing_id)
+                    checkpoint.set_cursor(cursor_name, idx + 1)
+                    continue
+                self._record_issue(
+                    report,
+                    "errors",
+                    "scheduled_transaction",
+                    source_id,
+                    "scheduled transaction has an ambiguous prior create; refusing a blind retry",
+                )
+                checkpoint.set_cursor(cursor_name, idx + 1)
+                continue
+
             try:
+                checkpoint.set_entity_status(
+                    "scheduled_transaction", str(source_id), "in_progress",
+                    payload_hash=stable_hash(payload), increment_attempt=True,
+                )
                 created = self.dest_client.create_scheduled_transaction(self.dest_plan_id, payload).get(
                     "scheduled_transaction", {}
                 )
@@ -3112,8 +4100,15 @@ class MigrationEngine:
                 if not dest_id:
                     raise RuntimeError("scheduled transaction response missing id")
                 checkpoint.set_mapping("scheduled_transaction", source_id, dest_id)
+                self._cache_destination_entity("scheduled_transactions", created)
                 checkpoint.add_event("INFO", f"scheduled_transaction mapped {source_id} -> {dest_id}")
             except Exception as error_obj:  # noqa: BLE001
+                checkpoint.set_entity_status(
+                    "scheduled_transaction",
+                    str(source_id),
+                    "ambiguous_commit" if not isinstance(error_obj, YNABApiError) else "retryable_failed",
+                    error=summarize_exception(error_obj),
+                )
                 self._record_issue(
                     report,
                     "errors",
@@ -3129,6 +4124,24 @@ class MigrationEngine:
             finally:
                 checkpoint.set_cursor(cursor_name, idx + 1)
 
+    def _find_existing_scheduled_transaction(self, expected_payload: Dict[str, Any]) -> Optional[str]:
+        cached_scheduled = self._cached_destination_entities("scheduled_transactions")
+        destination = clean_deleted(
+            cached_scheduled
+            if cached_scheduled is not None
+            else self.dest_client.get_scheduled_transactions(self.dest_plan_id).get(
+                "scheduled_transactions", []
+            )
+        )
+        expected = canonical_json(expected_payload)
+        matches = [
+            str(item["id"])
+            for item in destination
+            if item.get("id")
+            and canonical_json(self._normalize_destination_scheduled(item)) == expected
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def _apply_month_budgets(
         self,
         month_category_budgets: List[Dict[str, Any]],
@@ -3137,9 +4150,21 @@ class MigrationEngine:
         source_internal_category_ids: Set[str],
     ) -> None:
         cursor_name = "month_budgets_idx"
-        cursor = checkpoint.get_cursor(cursor_name)
+        cursor = 0
+        checkpoint.set_cursor(cursor_name, 0)
         category_map = checkpoint.get_mapping_dict("category")
         entries = sorted(month_category_budgets, key=lambda item: (item["month"], item["category_id"]))
+        destination_month_values: Dict[str, Dict[str, int]] = {}
+        cached_months = self._cached_destination_entities("months")
+        for destination_month in clean_deleted(cached_months or []):
+            month_key = destination_month.get("month")
+            if not month_key:
+                continue
+            destination_month_values[str(month_key)] = {
+                str(category.get("id")): _safe_int(category.get("budgeted"))
+                for category in clean_deleted(destination_month.get("categories", []))
+                if category.get("id")
+            }
         for idx in range(cursor, len(entries)):
             self._log_progress("apply", "month_budgets", idx + 1, len(entries))
             entry = entries[idx]
@@ -3179,12 +4204,37 @@ class MigrationEngine:
                 checkpoint.set_cursor(cursor_name, idx + 1)
                 continue
 
+            if month not in destination_month_values:
+                destination_month = self.dest_client.get_plan_month(self.dest_plan_id, month).get("month", {})
+                destination_month_values[month] = {
+                    str(category.get("id")): _safe_int(category.get("budgeted"))
+                    for category in clean_deleted(destination_month.get("categories", []))
+                    if category.get("id")
+                }
+            desired_budgeted = _safe_int(entry.get("budgeted"))
+            if (
+                str(dest_category_id) in destination_month_values[month]
+                and destination_month_values[month][str(dest_category_id)] == desired_budgeted
+            ):
+                checkpoint.set_entity_status(
+                    "month_budget", source_key, "succeeded", dest_id=str(dest_category_id)
+                )
+                checkpoint.set_cursor(cursor_name, idx + 1)
+                report.setdefault("batching", {}).setdefault("month_budget_noop_skips", 0)
+                report["batching"]["month_budget_noop_skips"] += 1
+                continue
+
             try:
                 self.dest_client.patch_month_category(
                     self.dest_plan_id,
                     month=month,
                     category_id=dest_category_id,
-                    budgeted=_safe_int(entry.get("budgeted")),
+                    budgeted=desired_budgeted,
+                )
+                destination_month_values[month][str(dest_category_id)] = desired_budgeted
+                checkpoint.set_entity_status(
+                    "month_budget", source_key, "succeeded", dest_id=str(dest_category_id),
+                    increment_attempt=True,
                 )
             except YNABApiError as error:
                 if int(getattr(error, "status_code", 0) or 0) == 404:
@@ -3221,6 +4271,13 @@ class MigrationEngine:
                         "dest_category_id": dest_category_id,
                         "budgeted": _safe_int(entry.get("budgeted")),
                     },
+                )
+                checkpoint.set_entity_status(
+                    "month_budget",
+                    source_key,
+                    "retryable_failed",
+                    error=summarize_exception(error),
+                    increment_attempt=True,
                 )
             finally:
                 checkpoint.set_cursor(cursor_name, idx + 1)
@@ -3279,6 +4336,7 @@ class MigrationEngine:
         transfer_account_id = tx.get("transfer_account_id")
         source_payee_id = tx.get("payee_id")
         source_category_id = tx.get("category_id")
+        subtransactions = clean_deleted(tx.get("subtransactions", []))
 
         if transfer_account_id:
             transfer_account = source_accounts_by_id.get(transfer_account_id)
@@ -3291,7 +4349,7 @@ class MigrationEngine:
             if not payee_id_candidate:
                 return None, f"missing transfer payee mapping for transfer_account_id={transfer_account_id}"
             payload["payee_id"] = payee_id_candidate
-            if source_category_id:
+            if source_category_id and not subtransactions:
                 mapped_category_id = category_map.get(source_category_id)
                 if mapped_category_id:
                     payload["category_id"] = mapped_category_id
@@ -3322,7 +4380,7 @@ class MigrationEngine:
                     if source_payee and source_payee.get("name"):
                         payload["payee_name"] = source_payee["name"]
 
-            if source_category_id:
+            if source_category_id and not subtransactions:
                 mapped_category_id = category_map.get(source_category_id)
                 if mapped_category_id:
                     payload["category_id"] = mapped_category_id
@@ -3343,8 +4401,13 @@ class MigrationEngine:
             else:
                 payload["category_id"] = None
 
-        subtransactions = clean_deleted(tx.get("subtransactions", []))
         if subtransactions:
+            subtransaction_total = sum(_safe_int(sub.get("amount")) for sub in subtransactions)
+            if subtransaction_total != _safe_int(tx.get("amount")):
+                return None, (
+                    "split transaction amount does not equal live subtransaction total "
+                    f"({_safe_int(tx.get('amount'))} != {subtransaction_total})"
+                )
             payload["category_id"] = None
             transformed_subs: List[Dict[str, Any]] = []
             for sub in subtransactions:
@@ -3373,7 +4436,7 @@ class MigrationEngine:
                 else:
                     transformed_sub["category_id"] = None
                 transformed_subs.append(transformed_sub)
-            payload["subtransactions"] = transformed_subs
+            payload["subtransactions"] = sorted(transformed_subs, key=canonical_json)
 
         if include_import_id and source_id and not tx.get("transfer_account_id") and not tx.get(
             "transfer_transaction_id"
@@ -3506,7 +4569,11 @@ class MigrationEngine:
         ):
             return
 
-        destination_plan = self.dest_client.get_plan(self.dest_plan_id).get("plan", {})
+        destination_plan = (
+            self._destination_plan_cache
+            if self._destination_plan_cache is not None
+            else self.dest_client.get_plan(self.dest_plan_id).get("plan", {})
+        )
         destination_groups = clean_deleted(destination_plan.get("category_groups", []))
         destination_categories = clean_deleted(destination_plan.get("categories", []))
 
@@ -3852,6 +4919,9 @@ class MigrationEngine:
                 if sub.get("payee_name") is not None and sub.get("payee_id") is None:
                     sub_norm["payee_name"] = sub.get("payee_name")
                 normalized["subtransactions"].append(sub_norm)
+            normalized["subtransactions"] = sorted(
+                normalized["subtransactions"], key=canonical_json
+            )
         return normalized
 
     def _normalize_destination_scheduled(self, scheduled: Dict[str, Any]) -> Dict[str, Any]:
@@ -3952,6 +5022,7 @@ class MigrationEngine:
         if candidate not in exclusions:
             exclusions.append(candidate)
             checkpoint.set_metadata("exclusions", exclusions)
+        checkpoint.set_entity_status(entity, source_id, "excluded", error=reason)
 
     def _append_warning(self, report: Dict[str, Any], message: str) -> None:
         report.setdefault("warnings", []).append(message)
